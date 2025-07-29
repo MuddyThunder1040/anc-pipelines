@@ -3,7 +3,7 @@ pipeline {
 
     environment {
         REPO_URL = 'https://github.com/MuddyThunder1040/aws-topology.git'
-        REPO_DIR = 'aws-topology/Local/mqain.tf'
+        REPO_DIR = 'aws-topology/Local/'
     }
 
     stages {
