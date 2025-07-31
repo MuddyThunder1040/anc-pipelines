@@ -1,11 +1,7 @@
-pipeline{
-    agent any 
-    environment {
-        Aws_ACCESS_KEY_ID = credentials('Aws-cli')
-        Aws_SECRET_ACCESS_KEY = credentials('aws-secret-key')
-    }
+pipeline {
+    agent any
     stages {
-        stage('Use AWS CLI') {
+        stage('AWS S3 Operations') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -15,6 +11,9 @@ pipeline{
                     )
                 ]) {
                     sh '''
+                        export AWS_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
+                        export AWS_SECRET_ACCESS_KEY=$AWS_SECRET_ACCESS_KEY
+
                         echo "Verifying AWS Identity..."
                         aws sts get-caller-identity
 
@@ -22,11 +21,6 @@ pipeline{
                         aws s3 ls
                     '''
                 }
-            }
-        stage('Aws s3 buckets show') {
-            steps {
-                echo 'Showing AWS S3 buckets...'
-                sh 'aws s3 ls'
             }
         }
     }
