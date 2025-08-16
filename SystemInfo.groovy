@@ -23,10 +23,11 @@ pipeline {
                 
             }
         }
-        post {
-            always {
-                echo "\u001B[31m=== PIPELINE COMPLETED ===\u001B[0m"
-            }
+    }
+    
+    post {
+        always {
+            echo "\u001B[31m=== PIPELINE COMPLETED ===\u001B[0m"
         }
     }
 }
