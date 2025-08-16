@@ -18,13 +18,14 @@ pipeline {
                 echo "\u001B[33m💾 Disk Usage:\u001B[0m"
                 sh 'df -h'
                 
-                echo "\u001B[33m🧠 Memory Usage:\u001B[0m"
-                sh 'free -m'
-                
                 echo "\u001B[33m⏰ System Uptime & Load:\u001B[0m"
                 sh 'uptime'
                 
-                echo "\u001B[32m✅ System Info Collection Complete\u001B[0m"
+            }
+        }
+        post {
+            always {
+                echo "\u001B[31m=== PIPELINE COMPLETED ===\u001B[0m"
             }
         }
     }
