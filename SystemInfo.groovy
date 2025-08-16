@@ -4,30 +4,30 @@ pipeline {
     stages {
         stage ("Connection Established") {
             steps {
-                echo "\u001B[32mConnection Established\u001B[0m"
+                echo "✅ Connection Established"
                 sh 'curl --max-time 5 google.com'
             }
         }
         stage ("System Info") {
             steps {
-                echo "\u001B[34m=== SYSTEM INFORMATION ===\u001B[0m"
+                echo "=== SYSTEM INFORMATION ==="
                 echo ""
-                echo "\u001B[33m📋 Operating System & Kernel Info:\u001B[0m"
+                echo "📋 Operating System & Kernel Info:"
                 sh 'uname -a'
-                
-                echo "\u001B[33m💾 Disk Usage:\u001B[0m"
+                echo ""
+                echo "💾 Disk Usage:"
                 sh 'df -h'
-                
-                echo "\u001B[33m⏰ System Uptime & Load:\u001B[0m"
+                echo ""
+                echo "⏰ System Uptime & Load:"
                 sh 'uptime'
-                
+                echo ""
             }
         }
     }
     
     post {
         always {
-            echo "\u001B[31m=== PIPELINE COMPLETED ===\u001B[0m"
+            echo "🏁 === PIPELINE COMPLETED ==="
         }
     }
 }
