@@ -2,22 +2,31 @@ pipeline {
     agent any
 
     stages {
-        stage('Collect System Info') {
+        stage ("Connection Established") {
             steps {
-                script {
-                    def sysInfo = ""
-                    if (isUnix()) {
-                        sysInfo = sh(script: 'uname -a && lsb_release -a || cat /etc/os-release && free -h && df -h', returnStdout: true)
-                    } else {
-                        sysInfo = bat(script: 'systeminfo', returnStdout: true)
-                    }
-                    writeFile file: 'systeminfo.txt', text: sysInfo
-                }
+                echo "\u001B[32mConnection Established\u001B[0m"
+            }
+            steps {
+                sh 'curl --max-time 5 google.com'
             }
         }
-        stage('Archive System Info') {
+        stage ("System Info") {
             steps {
-                archiveArtifacts artifacts: 'systeminfo.txt', onlyIfSuccessful: true
+                echo "\u001B[34m=== SYSTEM INFORMATION ===\"
+                
+                echo "\u001B[33m📋 Operating System & Kernel Info:\u001B[0m"
+                sh 'uname -a'
+                
+                echo "\u001B[33m💾 Disk Usage:\u001B[0m"
+                sh 'df -h'
+                
+                echo "\u001B[33m🧠 Memory Usage:\u001B[0m"
+                sh 'free -m'
+                
+                echo "\u001B[33m⏰ System Uptime & Load:\u001B[0m"
+                sh 'uptime'
+                
+                echo "\u001B[32m✅ System Info Collection Complete\u001B[0m"
             }
         }
     }
