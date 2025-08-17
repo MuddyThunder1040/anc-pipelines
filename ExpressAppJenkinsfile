@@ -8,7 +8,19 @@ pipeline {
     }
 
     stages {
-        stage('🔍 Checkout') {
+                           echo "🗄️ Initializing database..."
+                        # Pre-initialize database to ensure it's ready
+                        timeout 10s node -e "
+                            const Database = require('./database');
+                            const db = new Database();
+                            db.init().then(() => {
+                                console.log('✅ Database initialized successfully');
+                                process.exit(0);
+                            }).catch(err => {
+                                console.error('❌ Database initialization failed:', err);
+                                process.exit(1);
+                            });
+                        " || echo "⚠️ Database initialization timeout (may already be running)" Checkout') {
             steps {
                 echo "=== CHECKING OUT SOURCE CODE ==="
                 git url: 'https://github.com/MuddyThunder1040/appserver.git', branch: 'main'
