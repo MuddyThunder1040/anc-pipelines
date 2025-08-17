@@ -6,7 +6,7 @@ pipeline {
             steps {
                 echo "✅ Connection Established"
                 sh 'curl --max-time 5 google.com'
-            }
+            } 
         }
         stage ("System Info") {
             steps {

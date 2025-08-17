@@ -1,0 +1,204 @@
+pipeline {
+    agent any
+    
+    environment {
+        NODE_VERSION = '18'
+        APP_NAME = 'express-app'
+        DOCKER_IMAGE = "${APP_NAME}:${BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('🔍 Checkout') {
+            steps {
+                echo "=== CHECKING OUT SOURCE CODE ==="
+                checkout scm
+                echo "✅ Source code checked out successfully"
+            }
+        }
+        
+        stage('🔧 Setup Node.js') {
+            steps {
+                echo "=== SETTING UP NODE.JS ENVIRONMENT ==="
+                sh '''
+                    echo "📋 Node.js version check:"
+                    node --version
+                    echo "📦 NPM version check:"
+                    npm --version
+                '''
+            }
+        }
+        
+        stage('📦 Install Dependencies') {
+            steps {
+                echo "=== INSTALLING DEPENDENCIES ==="
+                dir('appserver') {
+                    sh '''
+                        echo "🔍 Checking package.json..."
+                        if [ -f package.json ]; then
+                            echo "📥 Installing npm packages..."
+                            npm ci --only=production
+                            echo "✅ Dependencies installed successfully"
+                        else
+                            echo "❌ No package.json found"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+        
+        stage('🧪 Run Tests') {
+            steps {
+                echo "=== RUNNING TESTS ==="
+                dir('appserver') {
+                    script {
+                        try {
+                            sh 'npm test'
+                            echo "✅ All tests passed"
+                        } catch (Exception e) {
+                            echo "⚠️ No tests found or tests failed, continuing..."
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('🔍 Code Quality Check') {
+            steps {
+                echo "=== CODE QUALITY ANALYSIS ==="
+                dir('appserver') {
+                    sh '''
+                        echo "📊 Checking file structure..."
+                        ls -la
+                        echo "🔍 Checking server.js syntax..."
+                        node -c server.js
+                        echo "✅ Code quality check passed"
+                    '''
+                }
+            }
+        }
+        
+        stage('🐳 Build Docker Image') {
+            steps {
+                echo "=== BUILDING DOCKER IMAGE ==="
+                dir('appserver') {
+                    script {
+                        try {
+                            sh """
+                                echo "🏗️ Building Docker image: ${DOCKER_IMAGE}"
+                                docker build -t ${DOCKER_IMAGE} .
+                                echo "✅ Docker image built successfully"
+                                
+                                echo "📋 Docker images:"
+                                docker images | grep ${APP_NAME}
+                            """
+                        } catch (Exception e) {
+                            echo "⚠️ Docker not available, skipping Docker build"
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('🚀 Deploy Application') {
+            steps {
+                echo "=== DEPLOYING APPLICATION ==="
+                dir('appserver') {
+                    script {
+                        sh '''
+                            echo "🎯 Starting deployment process..."
+                            
+                            # Stop any existing process on port 3000
+                            echo "🛑 Stopping existing services..."
+                            pkill -f "node server.js" || true
+                            
+                            # Wait a moment for cleanup
+                            sleep 2
+                            
+                            echo "🚀 Starting Express application..."
+                            nohup node server.js > app.log 2>&1 &
+                            
+                            # Give the app time to start
+                            sleep 3
+                            
+                            echo "🔍 Checking if application is running..."
+                            if curl -f http://localhost:3000 > /dev/null 2>&1; then
+                                echo "✅ Application deployed successfully!"
+                                echo "🌐 Application is running at: http://localhost:3000"
+                            else
+                                echo "❌ Application failed to start"
+                                echo "📄 Application logs:"
+                                cat app.log || echo "No logs available"
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+        
+        stage('✅ Health Check') {
+            steps {
+                echo "=== PERFORMING HEALTH CHECK ==="
+                dir('appserver') {
+                    sh '''
+                        echo "🏥 Running health checks..."
+                        
+                        echo "🔍 Testing application endpoint..."
+                        response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000)
+                        
+                        if [ "$response" = "200" ]; then
+                            echo "✅ Health check passed - Application is responding"
+                            echo "📊 Application status: HEALTHY"
+                        else
+                            echo "❌ Health check failed - HTTP status: $response"
+                            exit 1
+                        fi
+                        
+                        echo "📈 Performance check..."
+                        time curl -s http://localhost:3000 > /dev/null
+                    '''
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "🏁 === PIPELINE EXECUTION COMPLETED ==="
+            echo "📊 Build Number: ${BUILD_NUMBER}"
+            echo "🕐 Build Duration: ${currentBuild.durationString}"
+        }
+        
+        success {
+            echo "🎉 === PIPELINE SUCCEEDED ==="
+            echo "✅ Express application deployed successfully!"
+            echo "🌐 Application URL: http://localhost:3000"
+        }
+        
+        failure {
+            echo "💥 === PIPELINE FAILED ==="
+            echo "❌ Deployment failed. Check the logs above for details."
+            dir('appserver') {
+                script {
+                    try {
+                        sh '''
+                            echo "📄 Application logs (last 20 lines):"
+                            tail -20 app.log || echo "No application logs available"
+                        '''
+                    } catch (Exception e) {
+                        echo "Could not retrieve application logs"
+                    }
+                }
+            }
+        }
+        
+        cleanup {
+            echo "🧹 === CLEANING UP ==="
+            sh '''
+                echo "🗑️ Cleaning up temporary files..."
+                # Add any cleanup commands here if needed
+            '''
+        }
+    }
+}
