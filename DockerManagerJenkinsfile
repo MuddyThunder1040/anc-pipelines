@@ -98,6 +98,46 @@ pipeline {
             }
         }
         
+        stage('🩺 Container Health Diagnostics') {
+            when {
+                anyOf {
+                    equals expected: 'start', actual: params.ACTION
+                    equals expected: 'restart', actual: params.ACTION
+                    equals expected: 'status', actual: params.ACTION
+                }
+            }
+            steps {
+                echo "=== RUNNING CONTAINER DIAGNOSTICS ==="
+                script {
+                    sh '''
+                        echo "🔍 Checking for problematic containers (exit code 139)..."
+                        PROBLEM_CONTAINERS=$(docker ps -a --filter "status=exited" --format "{{.Names}}: {{.Status}}" | grep "139" || true)
+                        
+                        if [ -n "$PROBLEM_CONTAINERS" ]; then
+                            echo "⚠️ Found containers with exit code 139 (segmentation fault):"
+                            echo "$PROBLEM_CONTAINERS"
+                            
+                            echo "🧹 Cleaning up problematic containers..."
+                            docker ps -a --filter "status=exited" --format "{{.Names}}" | while read container; do
+                                if docker ps -a --filter "name=$container" --format "{{.Status}}" | grep -q "139"; then
+                                    echo "🗑️ Removing problematic container: $container"
+                                    docker rm "$container" 2>/dev/null || true
+                                fi
+                            done
+                        else
+                            echo "✅ No containers with exit code 139 found"
+                        fi
+                        
+                        echo "📊 Docker system prune (cleanup unused resources):"
+                        docker system prune -f --volumes || true
+                        
+                        echo "🔍 Checking Docker daemon status:"
+                        docker info | grep -E "(Server Version|Storage Driver|Logging Driver|Cgroup Driver)" || true
+                    '''
+                }
+            }
+        }
+        
         stage('🚀 Container Management') {
             steps {
                 echo "=== PERFORMING CONTAINER MANAGEMENT ==="
@@ -138,6 +178,12 @@ pipeline {
                         echo "💾 System resource usage:"
                         docker system df
                         
+                        echo "🖥️ Host system resources:"
+                        echo "Memory usage:"
+                        free -h || echo "free command not available"
+                        echo "Disk usage:"
+                        df -h / || echo "df command not available"
+                        
                         if [ "${ACTION}" = "start" ]; then
                             echo "🔍 Testing running containers..."
                             
@@ -145,9 +191,17 @@ pipeline {
                             if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
                                 echo "✅ Express app container is running"
                                 
+                                # Get detailed container information
+                                echo "🔍 Container detailed status:"
+                                docker inspect ${CONTAINER_NAME} --format "Status: {{.State.Status}}, ExitCode: {{.State.ExitCode}}, Error: {{.State.Error}}"
+                                
                                 # Get the port mapping
                                 CONTAINER_PORT=$(docker port ${CONTAINER_NAME} 3000 2>/dev/null | head -1 || echo "Port mapping not found")
                                 echo "🌐 Port mapping: ${CONTAINER_PORT}"
+                                
+                                # Show recent logs
+                                echo "📄 Recent container logs:"
+                                docker logs ${CONTAINER_NAME} --tail 20 || echo "No logs available"
                                 
                                 # Try to access the health endpoint if port is mapped
                                 if echo "$CONTAINER_PORT" | grep -q ":"; then
@@ -164,6 +218,8 @@ pipeline {
                                         else
                                             if [ $attempt -eq $max_attempts ]; then
                                                 echo "⚠️ Health check failed after $max_attempts attempts"
+                                                echo "🔍 Testing basic connectivity:"
+                                                curl -v http://localhost:$HOST_PORT 2>&1 | head -10 || echo "Connection failed"
                                             else
                                                 echo "⚠️ Health check attempt $attempt failed, retrying..."
                                                 sleep 2
@@ -174,7 +230,17 @@ pipeline {
                                 fi
                             else
                                 echo "ℹ️ Express app container not running or not found"
+                                echo "🔍 Checking if container exited:"
+                                if docker ps -a --filter "name=${CONTAINER_NAME}" | grep -q "${CONTAINER_NAME}"; then
+                                    echo "📄 Container logs (last 50 lines):"
+                                    docker logs ${CONTAINER_NAME} --tail 50 || echo "No logs available"
+                                    echo "🔍 Container exit details:"
+                                    docker inspect ${CONTAINER_NAME} --format "Status: {{.State.Status}}, ExitCode: {{.State.ExitCode}}, Error: {{.State.Error}}, StartedAt: {{.State.StartedAt}}, FinishedAt: {{.State.FinishedAt}}"
+                                fi
                             fi
+                            
+                            echo "🔄 Checking all container statuses for exit code 139 issues:"
+                            docker ps -a --filter "status=exited" --format "{{.Names}}: {{.Status}}" | grep "139" || echo "No containers with exit code 139 found"
                         fi
                     '''
                 }
@@ -212,11 +278,32 @@ pipeline {
                     sh '''
                         echo "🔍 Docker system diagnostics:"
                         docker system events --since 5m --until now || true
+                        
                         echo "📄 Docker daemon logs (if accessible):"
                         docker system info | grep -A 5 -B 5 "ERROR\\|WARN" || true
+                        
+                        echo "🩺 Container exit diagnostics:"
+                        docker ps -a --filter "status=exited" --format "table {{.Names}}\\t{{.Status}}\\t{{.Image}}"
+                        
+                        echo "📊 System resource check:"
+                        echo "Memory:"
+                        free -h 2>/dev/null || echo "Memory info not available"
+                        echo "Disk space:"
+                        df -h / 2>/dev/null || echo "Disk info not available"
+                        
+                        echo "🔍 Recent container logs for failed containers:"
+                        docker ps -a --filter "status=exited" --format "{{.Names}}" | head -3 | while read container; do
+                            echo "--- Logs for $container ---"
+                            docker logs "$container" --tail 10 2>/dev/null || echo "No logs for $container"
+                        done
+                        
+                        echo "🧹 Cleanup recommendations:"
+                        echo "- Consider running: docker system prune -f"
+                        echo "- Check available disk space"
+                        echo "- Restart Docker daemon if issues persist"
                     '''
                 } catch (Exception e) {
-                    echo "Could not retrieve Docker diagnostics"
+                    echo "Could not retrieve Docker diagnostics: ${e.getMessage()}"
                 }
             }
         }
@@ -249,22 +336,63 @@ def startContainers(containerTarget, specificContainer) {
             sh '''
                 echo "🚀 Managing Express app container..."
                 
-                # Check if container exists
+                # First, clean up any existing containers with the same name
                 if docker ps -a --filter "name=${CONTAINER_NAME}" | grep -q "${CONTAINER_NAME}"; then
-                    # Container exists, start it
-                    echo "📦 Starting existing Express app container..."
-                    docker start ${CONTAINER_NAME}
-                    echo "✅ Express app container started"
-                else
-                    # Container doesn't exist, create and run it
-                    echo "🏗️ Creating new Express app container..."
-                    
-                    # Stop any container using port 3001
-                    docker stop $(docker ps -q --filter "publish=3001") 2>/dev/null || true
-                    
-                    # Run new container
-                    docker run -d --name ${CONTAINER_NAME} -p 3001:3000 ${DOCKER_HUB_REPO}:latest
+                    echo "🧹 Cleaning up existing container..."
+                    docker stop ${CONTAINER_NAME} 2>/dev/null || true
+                    docker rm ${CONTAINER_NAME} 2>/dev/null || true
+                    echo "✅ Existing container cleaned up"
+                fi
+                
+                # Check if image exists
+                if ! docker images ${DOCKER_HUB_REPO}:latest | grep -q "${DOCKER_HUB_REPO}"; then
+                    echo "❌ Image ${DOCKER_HUB_REPO}:latest not found locally"
+                    echo "📥 Attempting to pull image..."
+                    docker pull ${DOCKER_HUB_REPO}:latest || {
+                        echo "❌ Failed to pull image. Check if image exists in registry."
+                        exit 1
+                    }
+                fi
+                
+                echo "🏗️ Creating new Express app container with enhanced configuration..."
+                
+                # Stop any container using port 3001
+                EXISTING_PORT_CONTAINER=$(docker ps -q --filter "publish=3001" 2>/dev/null)
+                if [ -n "$EXISTING_PORT_CONTAINER" ]; then
+                    echo "🛑 Stopping container using port 3001..."
+                    docker stop $EXISTING_PORT_CONTAINER 2>/dev/null || true
+                fi
+                
+                # Create container with restart policy and resource limits
+                docker run -d \\
+                    --name ${CONTAINER_NAME} \\
+                    -p 3001:3000 \\
+                    --restart=unless-stopped \\
+                    --memory=512m \\
+                    --memory-swap=1g \\
+                    --cpus=1.0 \\
+                    --health-cmd="curl -f http://localhost:3000/health || exit 1" \\
+                    --health-interval=30s \\
+                    --health-timeout=10s \\
+                    --health-retries=3 \\
+                    --health-start-period=40s \\
+                    ${DOCKER_HUB_REPO}:latest
+                
+                # Wait a moment for container to start
+                echo "⏳ Waiting for container to initialize..."
+                sleep 5
+                
+                # Check if container is running
+                if docker ps --filter "name=${CONTAINER_NAME}" --filter "status=running" | grep -q "${CONTAINER_NAME}"; then
                     echo "✅ New Express app container created and started on port 3001"
+                    echo "📋 Container status:"
+                    docker ps --filter "name=${CONTAINER_NAME}" --format "table {{.Names}}\\t{{.Status}}\\t{{.Ports}}"
+                else
+                    echo "❌ Container failed to start. Checking logs..."
+                    docker logs ${CONTAINER_NAME} --tail 20 || echo "No logs available"
+                    echo "🔍 Container details:"
+                    docker inspect ${CONTAINER_NAME} --format "Status: {{.State.Status}}, ExitCode: {{.State.ExitCode}}, Error: {{.State.Error}}"
+                    exit 1
                 fi
             '''
             break
