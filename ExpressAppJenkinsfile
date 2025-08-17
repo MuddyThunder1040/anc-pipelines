@@ -8,7 +8,29 @@ pipeline {
     }
 
     stages {
-        stage('🔍 Checkout') {
+                           echo "📊 Initializing database..."
+                        # Pre-initialize database to ensure it's ready
+                        node -e "
+                            const Database = require('./database');
+                            const db = new Database();
+                            
+                            // Set a timeout for database initialization
+                            const timeoutMs = 10000; // 10 seconds
+                            const timeoutPromise = new Promise((_, reject) => {
+                                setTimeout(() => reject(new Error('Database initialization timeout')), timeoutMs);
+                            });
+                            
+                            Promise.race([
+                                db.init(),
+                                timeoutPromise
+                            ]).then(() => {
+                                console.log('✅ Database initialized successfully');
+                                process.exit(0);
+                            }).catch(err => {
+                                console.error('❌ Database initialization failed:', err.message);
+                                process.exit(1);
+                            });
+                        " || echo "⚠️ Database initialization failed (may already be running)" Checkout') {
             steps {
                 echo "=== CHECKING OUT SOURCE CODE ==="
                 git url: 'https://github.com/MuddyThunder1040/appserver.git', branch: 'main'
@@ -263,31 +285,31 @@ pipeline {
                             max_attempts=6
                             attempt=1
                             
-                            while [ $attempt -le $max_attempts ]; do
-                                echo "🔄 Docker health check attempt $attempt/$max_attempts..."
+                            while [ \$attempt -le \$max_attempts ]; do
+                                echo "🔄 Docker health check attempt \$attempt/\$max_attempts..."
                                 sleep 5
                                 
                                 # Test Docker deployment with health endpoint
-                                docker_health_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/health)
-                                echo "🐳 Docker health response: $docker_health_response"
+                                docker_health_response=\$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/health)
+                                echo "🐳 Docker health response: \$docker_health_response"
                                 
-                                if [ "$docker_health_response" = "200" ] || [ "$docker_health_response" = "302" ]; then
+                                if [ "\$docker_health_response" = "200" ] || [ "\$docker_health_response" = "302" ]; then
                                     echo "✅ Docker deployment successful!"
                                     echo "🐳 Docker container running at: http://localhost:3001"
                                     break
                                 else
-                                    if [ $attempt -eq $max_attempts ]; then
-                                        echo "⚠️ Docker deployment test failed after $max_attempts attempts (HTTP: $docker_health_response)"
+                                    if [ \$attempt -eq \$max_attempts ]; then
+                                        echo "⚠️ Docker deployment test failed after \$max_attempts attempts (HTTP: \$docker_health_response)"
                                         echo "📄 Docker container logs:"
                                         docker logs ${APP_NAME}-container
                                         echo "🔍 Container status:"
                                         docker ps -a | grep ${APP_NAME}-container || true
                                     else
-                                        echo "⚠️ Attempt $attempt failed (HTTP: $docker_health_response), retrying..."
+                                        echo "⚠️ Attempt \$attempt failed (HTTP: \$docker_health_response), retrying..."
                                     fi
                                 fi
                                 
-                                attempt=$((attempt + 1))
+                                attempt=\$((attempt + 1))
                             done
                         """
                     } catch (Exception e) {
