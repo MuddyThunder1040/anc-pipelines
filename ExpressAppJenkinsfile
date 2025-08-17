@@ -112,8 +112,13 @@ pipeline {
                         echo "🛑 Stopping existing services..."
                         pkill -f "node server.js" || true
                         
-                        # Stop any existing Docker containers on port 3000
-                        docker stop $(docker ps -q --filter "publish=3000") 2>/dev/null || true
+                        # Stop any existing Docker containers on port 3000 (if Docker is accessible)
+                        if docker info > /dev/null 2>&1; then
+                            echo "🐳 Stopping Docker containers on port 3000..."
+                            docker stop $(docker ps -q --filter "publish=3000") 2>/dev/null || true
+                        else
+                            echo "⚠️ Docker not accessible, skipping Docker container cleanup"
+                        fi
                         
                         # Wait a moment for cleanup
                         sleep 2
