@@ -77,23 +77,25 @@ pipeline {
                 echo "=== BUILDING DOCKER IMAGE ==="
                 script {
                     try {
-                        sh '''
+                        sh """
                             echo "🔍 Checking Docker availability..."
-                            if docker info > /dev/null 2>&1; then
-                                echo "🏗️ Building Docker image: ${DOCKER_IMAGE}"
-                                docker build -t ${DOCKER_IMAGE} .
-                                echo "✅ Docker image built successfully"
-                                echo "📋 Docker images:"
-                                docker images | grep ${APP_NAME} || echo "No images found"
-                            else
-                                echo "⚠️ Docker daemon not accessible or not running"
-                                echo "💡 Hint: Check Docker daemon permissions or install Docker"
-                                exit 0
-                            fi
-                        '''
+                            docker --version
+                            docker info
+                            
+                            echo "🏗️ Building Docker image: ${DOCKER_IMAGE}"
+                            docker build -t ${DOCKER_IMAGE} .
+                            echo "✅ Docker image built successfully"
+                            
+                            echo "📋 Docker images:"
+                            docker images | grep ${APP_NAME} || echo "No previous images found"
+                            
+                            echo "🏷️ Tagging image as latest:"
+                            docker tag ${DOCKER_IMAGE} ${APP_NAME}:latest
+                        """
                     } catch (Exception e) {
                         echo "⚠️ Docker build failed: ${e.getMessage()}"
                         echo "🔄 Continuing pipeline without Docker image..."
+                        currentBuild.result = 'UNSTABLE'
                     }
                 }
             }
@@ -109,6 +111,9 @@ pipeline {
                         # Stop any existing process on port 3000
                         echo "🛑 Stopping existing services..."
                         pkill -f "node server.js" || true
+                        
+                        # Stop any existing Docker containers on port 3000
+                        docker stop $(docker ps -q --filter "publish=3000") 2>/dev/null || true
                         
                         # Wait a moment for cleanup
                         sleep 2
@@ -130,6 +135,43 @@ pipeline {
                             exit 1
                         fi
                     '''
+                }
+            }
+        }
+        
+        stage('🐳 Docker Deploy (Optional)') {
+            when {
+                expression { return currentBuild.result != 'UNSTABLE' }
+            }
+            steps {
+                echo "=== DEPLOYING WITH DOCKER ==="
+                script {
+                    try {
+                        sh """
+                            echo "🐳 Testing Docker deployment on port 3001..."
+                            
+                            # Stop any existing Docker containers for this app
+                            docker stop ${APP_NAME}-container 2>/dev/null || true
+                            docker rm ${APP_NAME}-container 2>/dev/null || true
+                            
+                            # Run the Docker container on port 3001 (to avoid conflict with port 3000)
+                            docker run -d --name ${APP_NAME}-container -p 3001:3000 ${DOCKER_IMAGE}
+                            
+                            # Wait for container to start
+                            sleep 5
+                            
+                            # Test Docker deployment
+                            if curl -f http://localhost:3001 > /dev/null 2>&1; then
+                                echo "✅ Docker deployment successful!"
+                                echo "🐳 Docker container running at: http://localhost:3001"
+                            else
+                                echo "⚠️ Docker deployment test failed"
+                                docker logs ${APP_NAME}-container
+                            fi
+                        """
+                    } catch (Exception e) {
+                        echo "⚠️ Docker deployment failed: ${e.getMessage()}"
+                    }
                 }
             }
         }
