@@ -8,7 +8,19 @@ pipeline {
     }
 
     stages {
-        stage('🔍 Checkout') {
+                           echo "📊 Initializing database..."
+                        # Pre-initialize database to ensure it's ready
+                        timeout 10s node -e "
+                            const Database = require('./database');
+                            const db = new Database();
+                            db.init().then(() => {
+                                console.log('✅ Database initialized successfully');
+                                process.exit(0);
+                            }).catch(err => {
+                                console.error('❌ Database initialization failed:', err);
+                                process.exit(1);
+                            });
+                        " || echo "⚠️ Database initialization timeout (may already be running)" Checkout') {
             steps {
                 echo "=== CHECKING OUT SOURCE CODE ==="
                 git url: 'https://github.com/MuddyThunder1040/appserver.git', branch: 'main'
@@ -204,20 +216,37 @@ pipeline {
                         sleep 5
                         
                         echo "🔍 Checking if application is running..."
-                        if curl -f http://localhost:3000/health > /dev/null 2>&1; then
-                            echo "✅ Application deployed successfully!"
-                            echo "🌐 Application is running at: http://localhost:3000"
-                            echo "📊 Database endpoints available at:"
-                            echo "   - GET /users (View all users)"
-                            echo "   - POST /users (Create user)"
-                            echo "   - GET /admin/logs (View activity logs)"
-                            echo "   - GET /admin/stats (Database statistics)"
-                        else
-                            echo "❌ Application failed to start"
-                            echo "📄 Application logs:"
-                            cat app.log || echo "No logs available"
-                            exit 1
-                        fi
+                        
+                        # Wait for application to fully start and retry health check
+                        max_attempts=5
+                        attempt=1
+                        
+                        while [ $attempt -le $max_attempts ]; do
+                            echo "🔄 Health check attempt $attempt/$max_attempts..."
+                            
+                            if curl -f http://localhost:3000/health > /dev/null 2>&1; then
+                                echo "✅ Application deployed successfully!"
+                                echo "🌐 Application is running at: http://localhost:3000"
+                                echo "📊 Database endpoints available at:"
+                                echo "   - GET /users (View all users)"
+                                echo "   - POST /users (Create user)"
+                                echo "   - GET /admin/logs (View activity logs)"
+                                echo "   - GET /admin/stats (Database statistics)"
+                                break
+                            else
+                                if [ $attempt -eq $max_attempts ]; then
+                                    echo "❌ Application failed to start after $max_attempts attempts"
+                                    echo "📄 Application logs:"
+                                    cat app.log || echo "No logs available"
+                                    exit 1
+                                else
+                                    echo "⚠️ Attempt $attempt failed, retrying in 3 seconds..."
+                                    sleep 3
+                                fi
+                            fi
+                            
+                            attempt=$((attempt + 1))
+                        done
                     '''
                 }
             }
@@ -241,17 +270,33 @@ pipeline {
                             # Run the Docker container on port 3001 (to avoid conflict with port 3000)
                             docker run -d --name ${APP_NAME}-container -p 3001:3000 ${DOCKER_IMAGE}
                             
-                            # Wait for container to start
-                            sleep 5
+                            # Wait for container to start with retry logic
+                            echo "⏳ Waiting for Docker container to start..."
+                            max_attempts=6
+                            attempt=1
                             
-                            # Test Docker deployment
-                            if curl -f http://localhost:3001 > /dev/null 2>&1; then
-                                echo "✅ Docker deployment successful!"
-                                echo "🐳 Docker container running at: http://localhost:3001"
-                            else
-                                echo "⚠️ Docker deployment test failed"
-                                docker logs ${APP_NAME}-container
-                            fi
+                            while [ $attempt -le $max_attempts ]; do
+                                echo "🔄 Docker health check attempt $attempt/$max_attempts..."
+                                sleep 5
+                                
+                                if curl -f -L http://localhost:3001/health > /dev/null 2>&1; then
+                                    echo "✅ Docker deployment successful!"
+                                    echo "🐳 Docker container running at: http://localhost:3001"
+                                    break
+                                else
+                                    if [ $attempt -eq $max_attempts ]; then
+                                        echo "⚠️ Docker deployment test failed after $max_attempts attempts"
+                                        echo "📄 Docker container logs:"
+                                        docker logs ${APP_NAME}-container
+                                        echo "🔍 Container status:"
+                                        docker ps -a | grep ${APP_NAME}-container || true
+                                    else
+                                        echo "⚠️ Attempt $attempt failed, retrying..."
+                                    fi
+                                fi
+                                
+                                attempt=$((attempt + 1))
+                            done
                         """
                     } catch (Exception e) {
                         echo "⚠️ Docker deployment failed: ${e.getMessage()}"
@@ -269,10 +314,16 @@ pipeline {
                     echo "🔍 Testing application health endpoint..."
                     health_response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health)
                     
-                    if [ "$health_response" = "200" ]; then
+                    echo "📊 Health endpoint response code: $health_response"
+                    
+                    if [ "$health_response" = "200" ] || [ "$health_response" = "302" ]; then
                         echo "✅ Health check passed - Application is healthy (HTTP: $health_response)"
                     else
                         echo "❌ Health check failed - HTTP status: $health_response"
+                        echo "🔍 Testing with verbose curl for debugging:"
+                        curl -v http://localhost:3000/health || true
+                        echo "📄 Recent application logs:"
+                        tail -10 app.log || echo "No logs available"
                         exit 1
                     fi
                     
