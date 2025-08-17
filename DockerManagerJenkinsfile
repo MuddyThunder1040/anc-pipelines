@@ -187,8 +187,10 @@ pipeline {
             echo "🏁 === DOCKER MANAGEMENT COMPLETED ==="
             echo "📊 Action performed: ${params.ACTION}"
             echo "🎯 Target: ${params.CONTAINER_TARGET}"
-            if (params.CONTAINER_TARGET == 'specific' && params.SPECIFIC_CONTAINER) {
-                echo "📝 Specific container: ${params.SPECIFIC_CONTAINER}"
+            script {
+                if (params.CONTAINER_TARGET == 'specific' && params.SPECIFIC_CONTAINER) {
+                    echo "📝 Specific container: ${params.SPECIFIC_CONTAINER}"
+                }
             }
         }
         
