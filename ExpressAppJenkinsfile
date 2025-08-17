@@ -8,29 +8,7 @@ pipeline {
     }
 
     stages {
-                           echo "📊 Initializing database..."
-                        # Pre-initialize database to ensure it's ready
-                        node -e "
-                            const Database = require('./database');
-                            const db = new Database();
-                            
-                            // Set a timeout for database initialization
-                            const timeoutMs = 10000; // 10 seconds
-                            const timeoutPromise = new Promise((_, reject) => {
-                                setTimeout(() => reject(new Error('Database initialization timeout')), timeoutMs);
-                            });
-                            
-                            Promise.race([
-                                db.init(),
-                                timeoutPromise
-                            ]).then(() => {
-                                console.log('✅ Database initialized successfully');
-                                process.exit(0);
-                            }).catch(err => {
-                                console.error('❌ Database initialization failed:', err.message);
-                                process.exit(1);
-                            });
-                        " || echo "⚠️ Database initialization failed (may already be running)" Checkout') {
+        stage('🔍 Checkout') {
             steps {
                 echo "=== CHECKING OUT SOURCE CODE ==="
                 git url: 'https://github.com/MuddyThunder1040/appserver.git', branch: 'main'
