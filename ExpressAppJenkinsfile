@@ -5,8 +5,8 @@ pipeline {
         NODE_VERSION = '18'
         APP_NAME = 'express-app'
         DOCKER_IMAGE = "${APP_NAME}:${BUILD_NUMBER}"
-        DOCKER_HUB_REPO = 'muddythunder1040/express-app'
-        DOCKER_HUB_CREDENTIALS = 'docker-hub-credentials'
+        DOCKER_HUB_REPO = 'muddythunder/express-app'
+        DOCKER_HUB_CREDENTIALS = 'c71d37ab-7559-4e0e-a3ea-fcf087717f4e'
     }
 
     stages {
@@ -192,6 +192,7 @@ pipeline {
                 echo "=== DEPLOYING APPLICATION ==="
                 script {
                     sh '''
+
                         echo "🎯 Starting deployment process..."
                         
                         # Stop any existing process on port 3000
@@ -456,7 +457,7 @@ pipeline {
             echo "   - GET /api (API information)"
             echo "🗄️ Database: SQLite with full CRUD operations"
             echo "🧪 Tests: Jest test suite with coverage reports"
-            echo "🐳 Docker: Images pushed to Docker Hub at https://hub.docker.com/r/muddythunder1040/express-app"
+            echo "🐳 Docker: Images pushed to Docker Hub at https://hub.docker.com/r/muddythunder/express-app"
         }
         
         failure {
