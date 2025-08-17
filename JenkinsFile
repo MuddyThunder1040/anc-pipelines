@@ -1,0 +1,36 @@
+pipeline {
+    agent any
+
+    stages {
+        stage('Initialize') {
+            steps {
+                echo 'Initializing Terraform...'
+                sh 'terraform init'
+            }
+        }
+        stage('Validate') {
+            steps {
+                echo 'Validating Terraform configuration...'
+                sh 'terraform validate'
+            }
+        }
+        stage('Plan') {
+            steps {
+                echo 'Planning Terraform changes...'
+                sh 'terraform plan -var-file=local.tf'
+            }
+        }
+        stage('Apply') {
+            steps {
+                input message: 'Approve to apply Terraform changes?'
+                echo 'Applying Terraform changes...'
+                sh 'terraform apply -auto-approve -var-file=local.tf'
+            }
+        }
+    }
+    post {
+        always {
+            echo 'Pipeline completed.'
+        }
+    }
+}
