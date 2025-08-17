@@ -146,12 +146,12 @@ pipeline {
                                 echo "✅ Express app container is running"
                                 
                                 # Get the port mapping
-                                CONTAINER_PORT=$(docker port ${CONTAINER_NAME} 3000 2>/dev/null || echo "Port mapping not found")
+                                CONTAINER_PORT=$(docker port ${CONTAINER_NAME} 3000 2>/dev/null | head -1 || echo "Port mapping not found")
                                 echo "🌐 Port mapping: ${CONTAINER_PORT}"
                                 
                                 # Try to access the health endpoint if port is mapped
-                                if [[ "$CONTAINER_PORT" == *":"* ]]; then
-                                    HOST_PORT=$(echo $CONTAINER_PORT | cut -d':' -f2)
+                                if echo "$CONTAINER_PORT" | grep -q ":"; then
+                                    HOST_PORT=$(echo $CONTAINER_PORT | grep -o '[0-9]*$' | head -1)
                                     echo "🏥 Testing health endpoint on port $HOST_PORT..."
                                     
                                     max_attempts=3
