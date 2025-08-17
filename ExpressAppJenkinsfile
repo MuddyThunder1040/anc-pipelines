@@ -5,6 +5,8 @@ pipeline {
         NODE_VERSION = '18'
         APP_NAME = 'express-app'
         DOCKER_IMAGE = "${APP_NAME}:${BUILD_NUMBER}"
+        DOCKER_HUB_REPO = 'muddythunder1040/express-app'
+        DOCKER_HUB_CREDENTIALS = 'docker-hub-credentials'
     }
 
     stages {
@@ -151,9 +153,33 @@ pipeline {
                             
                             echo "🏷️ Tagging image as latest:"
                             docker tag ${DOCKER_IMAGE} ${APP_NAME}:latest
+                            
+                            echo "🏷️ Tagging for Docker Hub:"
+                            docker tag ${DOCKER_IMAGE} ${DOCKER_HUB_REPO}:${BUILD_NUMBER}
+                            docker tag ${DOCKER_IMAGE} ${DOCKER_HUB_REPO}:latest
                         """
+                        
+                        // Push to Docker Hub
+                        withCredentials([usernamePassword(credentialsId: env.DOCKER_HUB_CREDENTIALS, 
+                                                        usernameVariable: 'DOCKER_USERNAME', 
+                                                        passwordVariable: 'DOCKER_PASSWORD')]) {
+                            sh """
+                                echo "🔐 Logging into Docker Hub..."
+                                echo \$DOCKER_PASSWORD | docker login -u \$DOCKER_USERNAME --password-stdin
+                                
+                                echo "📤 Pushing Docker image to Docker Hub..."
+                                docker push ${DOCKER_HUB_REPO}:${BUILD_NUMBER}
+                                docker push ${DOCKER_HUB_REPO}:latest
+                                
+                                echo "✅ Docker images pushed successfully to Docker Hub!"
+                                echo "🐳 Available at: https://hub.docker.com/r/${DOCKER_HUB_REPO}"
+                                
+                                echo "🧹 Logging out from Docker Hub..."
+                                docker logout
+                            """
+                        }
                     } catch (Exception e) {
-                        echo "⚠️ Docker build failed: ${e.getMessage()}"
+                        echo "⚠️ Docker build/push failed: ${e.getMessage()}"
                         echo "🔄 Continuing pipeline without Docker image..."
                         currentBuild.result = 'UNSTABLE'
                     }
@@ -256,7 +282,7 @@ pipeline {
                             docker rm ${APP_NAME}-container 2>/dev/null || true
                             
                             # Run the Docker container on port 3001 (to avoid conflict with port 3000)
-                            docker run -d --name ${APP_NAME}-container -p 3001:3000 ${DOCKER_IMAGE}
+                            docker run -d --name ${APP_NAME}-container -p 3001:3000 ${DOCKER_HUB_REPO}:${BUILD_NUMBER}
                             
                             # Wait for container to start with retry logic
                             echo "⏳ Waiting for Docker container to start..."
@@ -430,7 +456,7 @@ pipeline {
             echo "   - GET /api (API information)"
             echo "🗄️ Database: SQLite with full CRUD operations"
             echo "🧪 Tests: Jest test suite with coverage reports"
-            echo "🐳 Docker: Container ready for deployment"
+            echo "🐳 Docker: Images pushed to Docker Hub at https://hub.docker.com/r/muddythunder1040/express-app"
         }
         
         failure {
