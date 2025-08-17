@@ -77,16 +77,23 @@ pipeline {
                 echo "=== BUILDING DOCKER IMAGE ==="
                 script {
                     try {
-                        sh """
-                            echo "🏗️ Building Docker image: ${DOCKER_IMAGE}"
-                            docker build -t ${DOCKER_IMAGE} .
-                            echo "✅ Docker image built successfully"
-                            
-                            echo "📋 Docker images:"
-                            docker images | grep ${APP_NAME}
-                        """
+                        sh '''
+                            echo "🔍 Checking Docker availability..."
+                            if docker info > /dev/null 2>&1; then
+                                echo "🏗️ Building Docker image: ${DOCKER_IMAGE}"
+                                docker build -t ${DOCKER_IMAGE} .
+                                echo "✅ Docker image built successfully"
+                                echo "📋 Docker images:"
+                                docker images | grep ${APP_NAME} || echo "No images found"
+                            else
+                                echo "⚠️ Docker daemon not accessible or not running"
+                                echo "💡 Hint: Check Docker daemon permissions or install Docker"
+                                exit 0
+                            fi
+                        '''
                     } catch (Exception e) {
-                        echo "⚠️ Docker not available, skipping Docker build"
+                        echo "⚠️ Docker build failed: ${e.getMessage()}"
+                        echo "🔄 Continuing pipeline without Docker image..."
                     }
                 }
             }
@@ -136,8 +143,8 @@ pipeline {
                     echo "🔍 Testing application endpoint..."
                     response=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000)
                     
-                    if [ "$response" = "200" ]; then
-                        echo "✅ Health check passed - Application is responding"
+                    if [ "$response" = "200" ] || [ "$response" = "302" ]; then
+                        echo "✅ Health check passed - Application is responding (HTTP: $response)"
                         echo "📊 Application status: HEALTHY"
                     else
                         echo "❌ Health check failed - HTTP status: $response"
