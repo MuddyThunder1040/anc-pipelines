@@ -80,10 +80,28 @@ pipeline {
                             case 'show':
                                 sh """
                                     echo "[CURRENT STATE]"
-                                    terraform show -no-color
+                                    if [ -f terraform.tfstate ]; then
+                                        echo "State file found: terraform.tfstate"
+                                        terraform show -no-color
+                                        if [ -s terraform.tfstate ]; then
+                                            echo ""
+                                            echo "[STATE FILE CONTENT SUMMARY]"
+                                            cat terraform.tfstate | jq -r '.resources[]?.type + "." + .resources[]?.name' 2>/dev/null || echo "State file exists but may be empty or invalid JSON"
+                                        fi
+                                    else
+                                        echo "No terraform.tfstate file found"
+                                        terraform show -no-color 2>/dev/null || echo "No state available"
+                                    fi
                                     echo ""
                                     echo "[STATE LIST]"
-                                    terraform state list || echo "No resources in state"
+                                    terraform state list 2>/dev/null || echo "No resources in state"
+                                    echo ""
+                                    echo "[WORKSPACE INFO]"
+                                    terraform workspace show 2>/dev/null || echo "Default workspace"
+                                    echo ""
+                                    echo "[CONFIGURATION PREVIEW]"
+                                    echo "Terraform files in current directory:"
+                                    ls -la *.tf 2>/dev/null || echo "No .tf files found"
                                 """
                                 break
                             case 'init':
