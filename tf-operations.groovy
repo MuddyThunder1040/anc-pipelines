@@ -163,7 +163,7 @@ pipeline {
                                     terraform show -no-color
                                     echo ""
                                     echo "🗂️ State list:"
-                                    terraform state list || echo "No resources in state"
+                                    terraform show 
                                 """
                                 break
                                 
