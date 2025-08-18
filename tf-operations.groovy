@@ -83,7 +83,7 @@ pipeline {
                                     terraform show -no-color
                                     echo ""
                                     echo "\u001B[36m[STATE LIST]\u001B[0m"
-                                    terraform state list || echo "No resources in state"
+                                    terraform show"
                                 """
                                 break
                             case 'init':
