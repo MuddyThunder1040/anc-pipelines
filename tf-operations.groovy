@@ -181,9 +181,9 @@ EOF
                                 echo ""
                                 echo "[ARCHIVE SUMMARY]"
                                 echo "Total archives for ${params.TF_MODULE}:"
-                                ls -la ../../terraform-archives/${params.TF_MODULE}/ | grep -E '\\.(tfstate|meta)$' | wc -l
+                                ls -la ../../terraform-archives/${params.TF_MODULE}/ | grep -E '\\.(tfstate|meta)\$' | wc -l
                                 echo "Latest 5 archives:"
-                                ls -lt ../../terraform-archives/${params.TF_MODULE}/*.tfstate 2>/dev/null | head -5 | awk '{print \$9, \$5, \$6, \$7, \$8}' || echo "No previous archives"
+                                ls -lt ../../terraform-archives/${params.TF_MODULE}/*.tfstate 2>/dev/null | head -5 | awk '{print \$\$9, \$\$5, \$\$6, \$\$7, \$\$8}' || echo "No previous archives"
                                 
                             else
                                 echo "❌ No terraform.tfstate file found"
@@ -239,7 +239,7 @@ EOF
                                 echo "📚 Total archived states: \$ARCHIVE_COUNT"
                                 echo "📋 Recent archives (last 3):"
                                 ls -lt ../../terraform-archives/${params.TF_MODULE}/*.tfstate 2>/dev/null | head -3 | while read line; do
-                                    echo "  \$(echo \$line | awk '{print \$9}' | xargs basename) - \$(echo \$line | awk '{print \$6, \$7, \$8}')"
+                                    echo "  \$(echo \$line | awk '{print \$\$9}' | xargs basename) - \$(echo \$line | awk '{print \$\$6, \$\$7, \$\$8}')"
                                 done
                             else
                                 echo "📭 No archives found yet"
