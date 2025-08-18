@@ -3,7 +3,7 @@ pipeline {
     parameters {
         choice(name: 'TF_OPERATION', choices: ['plan', 'apply', 'destroy', 'show', 'init', 'validate'], description: 'Select the Terraform operation to perform')
         choice(name: 'TF_MODULE', choices: ['Local', 'S3', 'VPC'], description: 'Select the Terraform module to operate on')
-        string(name: 'Branch', defaultValue: 'main', description: 'Git branch to use')
+        string(name: 'Branch', defaultValue: 'master', description: 'Git branch to use')
         booleanParam(name: 'PLAN_ONLY', defaultValue: false, description: 'Run plan only without apply (safety check)')
         string(name: 'TF_VAR_FILE', defaultValue: '', description: 'Optional: Terraform variables file (e.g., terraform.tfvars)')
     }
