@@ -45,7 +45,7 @@ pipeline {
             }
         }
 
-        stage("Terraform ${params.TF_OPERATION}") {
+        stage("Execute Terraform Operation") {
             steps {
                 echo "\u001B[34m[INFO]\u001B[0m Running: ${params.TF_OPERATION}"
                 script {
