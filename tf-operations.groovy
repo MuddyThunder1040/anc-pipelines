@@ -36,6 +36,18 @@ pipeline {
                 echo "\u001B[34m[INFO]\u001B[0m Init & Validate"
                 script {
                     dir("aws-topology/${params.TF_MODULE}") {
+                        // Restore previous state file if it exists
+                        sh """
+                            echo "[INFO] Checking for existing state file..."
+                            if [ -f "/tmp/terraform-state-${params.TF_MODULE}.tfstate" ]; then
+                                echo "[INFO] Restoring previous state file"
+                                cp /tmp/terraform-state-${params.TF_MODULE}.tfstate terraform.tfstate
+                                echo "[INFO] State file restored from /tmp/terraform-state-${params.TF_MODULE}.tfstate"
+                            else
+                                echo "[INFO] No previous state file found"
+                            fi
+                        """
+                        
                         sh """
                             terraform init -upgrade
                             terraform validate
@@ -118,15 +130,62 @@ pipeline {
             }
         }
 
+        stage("State Management") {
+            steps {
+                echo "\u001B[34m[INFO]\u001B[0m Managing Terraform State"
+                script {
+                    dir("aws-topology/${params.TF_MODULE}") {
+                        sh """
+                            echo "[STATE FILE CHECK]"
+                            if [ -f terraform.tfstate ]; then
+                                echo "✅ terraform.tfstate exists"
+                                echo "📊 State file size: \$(du -h terraform.tfstate | cut -f1)"
+                                echo "📅 State file modified: \$(stat -c %y terraform.tfstate 2>/dev/null || stat -f %Sm terraform.tfstate)"
+                                
+                                echo ""
+                                echo "[STATE BACKUP]"
+                                cp terraform.tfstate /tmp/terraform-state-${params.TF_MODULE}.tfstate
+                                echo "💾 State backed up to /tmp/terraform-state-${params.TF_MODULE}.tfstate"
+                            else
+                                echo "❌ No terraform.tfstate file found"
+                            fi
+                            
+                            echo ""
+                            echo "[CURRENT RESOURCES]"
+                            terraform state list 2>/dev/null || echo "No resources in state"
+                            
+                            echo ""
+                            echo "[WORKSPACE STATUS]"
+                            echo "Current workspace: \$(terraform workspace show)"
+                            echo "Available workspaces:"
+                            terraform workspace list 2>/dev/null || echo "Only default workspace"
+                        """
+                    }
+                }
+            }
+        }
+
         stage("Summary") {
             steps {
                 echo "\u001B[34m[INFO]\u001B[0m Summary"
                 script {
                     dir("aws-topology/${params.TF_MODULE}") {
+                        // Save state file for future runs
                         sh """
                             echo "Directory: \$(pwd)"
                             echo "Module: ${params.TF_MODULE}"
                             echo "Operation: ${params.TF_OPERATION}"
+                            
+                            # Save state file if it exists
+                            if [ -f terraform.tfstate ]; then
+                                echo "[INFO] Saving state file for future runs"
+                                cp terraform.tfstate /tmp/terraform-state-${params.TF_MODULE}.tfstate
+                                echo "[INFO] State file saved to /tmp/terraform-state-${params.TF_MODULE}.tfstate"
+                                echo "[INFO] State file size: \$(du -h terraform.tfstate | cut -f1)"
+                            else
+                                echo "[INFO] No state file to save"
+                            fi
+                            
                             terraform state list 2>/dev/null | head -10 || echo "No resources"
                         """
                     }
