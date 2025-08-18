@@ -53,20 +53,38 @@ pipeline {
                         def tfVarFile = params.TF_VAR_FILE ? "-var-file=${params.TF_VAR_FILE}" : ""
                         switch(params.TF_OPERATION) {
                             case 'plan':
-                                sh "terraform plan ${tfVarFile} -out=tfplan && terraform show -no-color tfplan | head -20"
+                                sh """
+                                    terraform plan ${tfVarFile} -out=tfplan
+                                    echo "\u001B[36m[PLAN SUMMARY]\u001B[0m"
+                                    terraform show -no-color tfplan | head -30
+                                """
                                 break
                             case 'apply':
                                 if (params.PLAN_ONLY) {
                                     sh "terraform plan ${tfVarFile}"
                                 } else {
-                                    sh "terraform apply tfplan"
+                                    sh """
+                                        terraform plan ${tfVarFile} -out=tfplan
+                                        terraform apply tfplan
+                                    """
                                 }
                                 break
                             case 'destroy':
-                                sh "terraform plan -destroy ${tfVarFile} -out=destroy-plan && terraform apply destroy-plan"
+                                sh """
+                                    echo "\u001B[31m[WARNING]\u001B[0m This will destroy infrastructure!"
+                                    terraform plan -destroy ${tfVarFile} -out=destroy-plan
+                                    terraform show -no-color destroy-plan | head -30
+                                    terraform apply destroy-plan
+                                """
                                 break
                             case 'show':
-                                sh "terraform show -no-color"
+                                sh """
+                                    echo "\u001B[36m[CURRENT STATE]\u001B[0m"
+                                    terraform show -no-color
+                                    echo ""
+                                    echo "\u001B[36m[STATE LIST]\u001B[0m"
+                                    terraform state list || echo "No resources in state"
+                                """
                                 break
                             case 'init':
                                 sh "terraform init -upgrade -reconfigure"
@@ -110,3 +128,4 @@ pipeline {
             echo "\u001B[31m[FAIL]\u001B[0m Terraform operation failed"
         }
     }
+}
