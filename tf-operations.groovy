@@ -27,10 +27,10 @@ pipeline {
                     sh 'rm -rf aws-topology || true'
                     
                     // Clone the repository
-                    sh 'git clone -b ${params.Branch} --single-branch https://github.com/MuddyThunder1040/aws-topology.git'
+                    sh "git clone -b ${params.Branch} --single-branch https://github.com/MuddyThunder1040/aws-topology.git"
                     
                     // Verify the module directory exists
-                    sh '''
+                    sh """
                         if [ ! -d "aws-topology/${params.TF_MODULE}" ]; then
                             echo "❌ Module directory aws-topology/${params.TF_MODULE} not found!"
                             echo "📁 Available directories:"
@@ -38,7 +38,7 @@ pipeline {
                             exit 1
                         fi
                         echo "✅ Module directory verified: aws-topology/${params.TF_MODULE}"
-                    '''
+                    """
                 }
                 
                 echo "✅ Source code ready for Terraform operations from branch ${params.Branch}"
@@ -54,7 +54,7 @@ pipeline {
                 
                 script {
                     dir("aws-topology/${params.TF_MODULE}") {
-                        sh '''
+                        sh """
                             echo "🔍 Current working directory:"
                             pwd
                             echo ""
@@ -69,7 +69,7 @@ pipeline {
                             echo ""
                             echo "🔧 Initializing Terraform..."
                             terraform init -upgrade
-                        '''
+                        """
                     }
                 }
             }
@@ -82,7 +82,7 @@ pipeline {
                 
                 script {
                     dir("aws-topology/${params.TF_MODULE}") {
-                        sh '''
+                        sh """
                             echo "✅ Validating Terraform configuration..."
                             terraform validate
                             echo ""
@@ -95,7 +95,7 @@ pipeline {
                                 terraform fmt -recursive
                                 echo "✅ Files formatted"
                             }
-                        '''
+                        """
                     }
                 }
                 echo "✅ Validation and dependencies completed"
@@ -198,14 +198,14 @@ pipeline {
                 
                 script {
                     dir("aws-topology/${params.TF_MODULE}") {
-                        sh '''
-                            echo "📁 Working directory: $(pwd)"
-                            echo "🏗️ Module: ${TF_MODULE}"
-                            echo "⚙️ Operation: ${TF_OPERATION}"
-                            echo "🌿 Branch: ${Branch}"
+                        sh """
+                            echo "📁 Working directory: \$(pwd)"
+                            echo "🏗️ Module: ${params.TF_MODULE}"
+                            echo "⚙️ Operation: ${params.TF_OPERATION}"
+                            echo "🌿 Branch: ${params.Branch}"
                             echo ""
                             
-                            if [ "${TF_OPERATION}" != "destroy" ]; then
+                            if [ "${params.TF_OPERATION}" != "destroy" ]; then
                                 echo "📋 Current resources (if any):"
                                 terraform state list 2>/dev/null | head -10 || echo "No resources in state file"
                                 echo ""
@@ -216,7 +216,7 @@ pipeline {
                             echo ""
                             echo "📁 Generated files:"
                             ls -la *.tfplan *.tfstate* 2>/dev/null || echo "No plan or state files found"
-                        '''
+                        """
                     }
                 }
             }
@@ -257,10 +257,10 @@ pipeline {
             script {
                 try {
                     dir("aws-topology/${params.TF_MODULE}") {
-                        sh '''
+                        sh """
                             echo "🔍 Terraform diagnostics:"
-                            echo "Current directory: $(pwd)"
-                            echo "Terraform version: $(terraform version)"
+                            echo "Current directory: \$(pwd)"
+                            echo "Terraform version: \$(terraform version)"
                             echo ""
                             echo "📁 Directory contents:"
                             ls -la
@@ -270,7 +270,7 @@ pipeline {
                             echo ""
                             echo "📄 Recent logs (if any):"
                             tail -20 *.log 2>/dev/null || echo "No log files found"
-                        '''
+                        """
                     }
                 } catch (Exception e) {
                     echo "Could not retrieve diagnostics: ${e.getMessage()}"
@@ -281,11 +281,11 @@ pipeline {
         cleanup {
             script {
                 // Optional cleanup of large files
-                sh '''
+                sh """
                     echo "🧹 Cleaning up large temporary files..."
                     find . -name "*.tfplan" -size +10M -delete 2>/dev/null || true
                     echo "✅ Cleanup completed"
-                '''
+                """
             }
         }
     }
