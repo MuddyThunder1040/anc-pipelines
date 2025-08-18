@@ -22,10 +22,10 @@ pipeline {
                     sh "git clone -b ${params.Branch} --single-branch https://github.com/MuddyThunder1040/aws-topology.git"
                     sh """
                         if [ ! -d "aws-topology/${params.TF_MODULE}" ]; then
-                            echo "\u001B[31m[ERROR]\u001B[0m Module directory aws-topology/${params.TF_MODULE} not found!"
+                            echo "[ERROR] Module directory aws-topology/${params.TF_MODULE} not found!"
                             exit 1
                         fi
-                        echo "\u001B[32m[SUCCESS]\u001B[0m Module directory found: aws-topology/${params.TF_MODULE}"
+                        echo "[SUCCESS] Module directory found: aws-topology/${params.TF_MODULE}"
                     """
                 }
             }
@@ -55,7 +55,7 @@ pipeline {
                             case 'plan':
                                 sh """
                                     terraform plan ${tfVarFile} -out=tfplan
-                                    echo "\u001B[36m[PLAN SUMMARY]\u001B[0m"
+                                    echo "[PLAN SUMMARY]"
                                     terraform show -no-color tfplan | head -30
                                 """
                                 break
@@ -71,7 +71,7 @@ pipeline {
                                 break
                             case 'destroy':
                                 sh """
-                                    echo "\u001B[31m[WARNING]\u001B[0m This will destroy infrastructure!"
+                                    echo "[WARNING] This will destroy infrastructure!"
                                     terraform plan -destroy ${tfVarFile} -out=destroy-plan
                                     terraform show -no-color destroy-plan | head -30
                                     terraform apply destroy-plan
@@ -79,11 +79,11 @@ pipeline {
                                 break
                             case 'show':
                                 sh """
-                                    echo "\u001B[36m[CURRENT STATE]\u001B[0m"
+                                    echo "[CURRENT STATE]"
                                     terraform show -no-color
                                     echo ""
-                                    echo "\u001B[36m[STATE LIST]\u001B[0m"
-                                    terraform show"
+                                    echo "[STATE LIST]"
+                                    terraform state list || echo "No resources in state"
                                 """
                                 break
                             case 'init':
@@ -93,7 +93,7 @@ pipeline {
                                 sh "terraform validate"
                                 break
                             default:
-                                error "\u001B[31m[ERROR]\u001B[0m Unknown operation: ${params.TF_OPERATION}"
+                                error "[ERROR] Unknown operation: ${params.TF_OPERATION}"
                         }
                     }
                 }
@@ -106,9 +106,9 @@ pipeline {
                 script {
                     dir("aws-topology/${params.TF_MODULE}") {
                         sh """
-                            echo "\u001B[36mDirectory:\u001B[0m \$(pwd)"
-                            echo "\u001B[36mModule:\u001B[0m ${params.TF_MODULE}"
-                            echo "\u001B[36mOperation:\u001B[0m ${params.TF_OPERATION}"
+                            echo "Directory: \$(pwd)"
+                            echo "Module: ${params.TF_MODULE}"
+                            echo "Operation: ${params.TF_OPERATION}"
                             terraform state list 2>/dev/null | head -10 || echo "No resources"
                         """
                     }
