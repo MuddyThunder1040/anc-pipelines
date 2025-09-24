@@ -284,10 +284,12 @@ pipeline {
                 script {
                     dir("${WORKSPACE_DIR}") {
                         echo "📋 Creating Terraform plan..."
-                        sh 'terraform plan -out=tfplan'
-                        
-                        // Save plan output for review
-                        sh 'terraform show -no-color tfplan > plan-output.txt'
+                        withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                            sh 'terraform plan -out=tfplan'
+                            
+                            // Save plan output for review
+                            sh 'terraform show -no-color tfplan > plan-output.txt'
+                        }
                         archiveArtifacts artifacts: 'plan-output.txt', fingerprint: true
                     }
                 }
@@ -361,7 +363,9 @@ pipeline {
                                 }
                             }
                             
-                            sh 'terraform apply -auto-approve tfplan'
+                            withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                sh 'terraform apply -auto-approve tfplan'
+                            }
                             
                         } else if (params.DEPLOYMENT_ACTION == 'destroy') {
                             echo "💥 Destroying ${params.DATABASE_TYPE} cluster..."
@@ -377,7 +381,9 @@ pipeline {
                                       ]
                             }
                             
-                            sh 'terraform destroy -auto-approve'
+                            withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                sh 'terraform destroy -auto-approve'
+                            }
                         }
                     }
                 }
@@ -399,8 +405,10 @@ pipeline {
                             def updatedVars = currentVars.replaceAll(/asg_desired_capacity\s*=\s*\d+/, "asg_desired_capacity = ${params.CASSANDRA_NODE_COUNT}")
                             writeFile file: 'terraform.tfvars', text: updatedVars
                             
-                            sh 'terraform plan -out=scale-plan'
-                            sh 'terraform apply -auto-approve scale-plan'
+                            withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                sh 'terraform plan -out=scale-plan'
+                                sh 'terraform apply -auto-approve scale-plan'
+                            }
                             
                         } else if (params.DATABASE_TYPE == 'dynamodb') {
                             if (params.DYNAMODB_BILLING_MODE == 'PROVISIONED') {
@@ -411,8 +419,10 @@ pipeline {
                                     .replaceAll(/write_capacity\s*=\s*\d+/, "write_capacity = ${params.DYNAMODB_WRITE_CAPACITY}")
                                 writeFile file: 'terraform.tfvars', text: updatedVars
                                 
-                                sh 'terraform plan -out=scale-plan'
-                                sh 'terraform apply -auto-approve scale-plan'
+                                withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                                    sh 'terraform plan -out=scale-plan'
+                                    sh 'terraform apply -auto-approve scale-plan'
+                                }
                             } else {
                                 echo "ℹ️ DynamoDB on-demand scaling is automatic"
                             }
@@ -431,40 +441,42 @@ pipeline {
                     dir("${WORKSPACE_DIR}") {
                         echo "💾 Creating backup for ${params.DATABASE_TYPE}..."
                         
-                        if (params.DATABASE_TYPE == 'cassandra') {
-                            // Export Terraform state and create AMI snapshots
-                            sh 'terraform state pull > terraform-state-backup.json'
-                            
-                            // Get instance IDs from Terraform output
-                            def instanceIds = sh(
-                                script: 'terraform output -json cassandra_instance_ids | jq -r ".[]"',
-                                returnStdout: true
-                            ).trim().split('\n')
-                            
-                            // Create AMI backups
-                            for (instanceId in instanceIds) {
+                        withCredentials([usernamePassword(credentialsId: 'aws-cli', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                            if (params.DATABASE_TYPE == 'cassandra') {
+                                // Export Terraform state and create AMI snapshots
+                                sh 'terraform state pull > terraform-state-backup.json'
+                                
+                                // Get instance IDs from Terraform output
+                                def instanceIds = sh(
+                                    script: 'terraform output -json cassandra_instance_ids | jq -r ".[]"',
+                                    returnStdout: true
+                                ).trim().split('\n')
+                                
+                                // Create AMI backups
+                                for (instanceId in instanceIds) {
+                                    sh """
+                                        aws ec2 create-image \\
+                                            --instance-id ${instanceId} \\
+                                            --name "${params.CLUSTER_NAME}-backup-\$(date +%Y%m%d-%H%M%S)" \\
+                                            --description "Automated backup of ${params.CLUSTER_NAME}" \\
+                                            --region ${params.AWS_REGION}
+                                    """
+                                }
+                                
+                            } else if (params.DATABASE_TYPE == 'dynamodb') {
+                                // Create DynamoDB backup
+                                def tableName = sh(
+                                    script: 'terraform output -raw main_table_name',
+                                    returnStdout: true
+                                ).trim()
+                                
                                 sh """
-                                    aws ec2 create-image \\
-                                        --instance-id ${instanceId} \\
-                                        --name "${params.CLUSTER_NAME}-backup-\$(date +%Y%m%d-%H%M%S)" \\
-                                        --description "Automated backup of ${params.CLUSTER_NAME}" \\
+                                    aws dynamodb create-backup \\
+                                        --table-name ${tableName} \\
+                                        --backup-name "${tableName}-backup-\$(date +%Y%m%d-%H%M%S)" \\
                                         --region ${params.AWS_REGION}
                                 """
                             }
-                            
-                        } else if (params.DATABASE_TYPE == 'dynamodb') {
-                            // Create DynamoDB backup
-                            def tableName = sh(
-                                script: 'terraform output -raw main_table_name',
-                                returnStdout: true
-                            ).trim()
-                            
-                            sh """
-                                aws dynamodb create-backup \\
-                                    --table-name ${tableName} \\
-                                    --backup-name "${tableName}-backup-\$(date +%Y%m%d-%H%M%S)" \\
-                                    --region ${params.AWS_REGION}
-                            """
                         }
                         
                         archiveArtifacts artifacts: '*.json', allowEmptyArchive: true
