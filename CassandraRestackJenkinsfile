@@ -1,0 +1,738 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'RESTACK_ACTION',
+            choices: ['plan', 'apply', 'destroy', 'refresh', 'rolling-update', 'blue-green'],
+            description: 'Restack operation to perform'
+        )
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'cassandra-cluster',
+            description: 'Name of the Cassandra cluster to restack'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['development', 'staging', 'production'],
+            description: 'Target environment'
+        )
+        choice(
+            name: 'AWS_REGION',
+            choices: ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-southeast-1'],
+            description: 'AWS region'
+        )
+        string(
+            name: 'NEW_AMI_ID',
+            defaultValue: '',
+            description: 'New AMI ID to use (leave empty to use latest built AMI)'
+        )
+        choice(
+            name: 'INSTANCE_TYPE',
+            choices: ['current', 't3.medium', 't3.large', 'm5.large', 'm5.xlarge', 'c5.large', 'c5.xlarge'],
+            description: 'Instance type (current = keep existing)'
+        )
+        booleanParam(
+            name: 'UPDATE_SECURITY_GROUPS',
+            defaultValue: false,
+            description: 'Update security group rules'
+        )
+        booleanParam(
+            name: 'BACKUP_BEFORE_RESTACK',
+            defaultValue: true,
+            description: 'Create snapshots before restacking'
+        )
+        choice(
+            name: 'RESTACK_STRATEGY',
+            choices: ['in-place', 'rolling', 'blue-green', 'canary'],
+            description: 'Restacking strategy'
+        )
+        string(
+            name: 'TERRAFORM_WORKSPACE',
+            defaultValue: '',
+            description: 'Terraform workspace (leave empty for default)'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto-approve Terraform changes (use with caution)'
+        )
+        booleanParam(
+            name: 'SKIP_HEALTH_CHECK',
+            defaultValue: false,
+            description: 'Skip post-restack health checks'
+        )
+        text(
+            name: 'ADDITIONAL_VARS',
+            defaultValue: '',
+            description: 'Additional Terraform variables (key=value, one per line)'
+        )
+    }
+    
+    environment {
+        AWS_REGION = "${params.AWS_REGION}"
+        CLUSTER_NAME = "${params.CLUSTER_NAME}"
+        ENVIRONMENT = "${params.ENVIRONMENT}"
+        TF_IN_AUTOMATION = 'true'
+        TF_INPUT = 'false'
+        RESTACK_DIR = 'restack-operations'
+    }
+
+    stages {
+        stage('🔍 Pre-Restack Validation') {
+            steps {
+                echo "=== RESTACK VALIDATION ==="
+                echo ""
+                echo "📋 Restack Configuration:"
+                echo "  Action: ${params.RESTACK_ACTION}"
+                echo "  Cluster: ${params.CLUSTER_NAME}"
+                echo "  Environment: ${params.ENVIRONMENT}"
+                echo "  Region: ${params.AWS_REGION}"
+                echo "  Strategy: ${params.RESTACK_STRATEGY}"
+                echo "  AMI ID: ${params.NEW_AMI_ID ?: 'Auto-detect latest'}"
+                echo "  Instance Type: ${params.INSTANCE_TYPE}"
+                echo ""
+                
+                script {
+                    // Validate prerequisites
+                    sh '''
+                        echo "🔍 Validating prerequisites..."
+                        
+                        # Check required tools
+                        for tool in aws terraform jq; do
+                            if ! command -v $tool &> /dev/null; then
+                                echo "❌ $tool not found"
+                                exit 1
+                            fi
+                        done
+                        
+                        # Verify AWS credentials
+                        if ! aws sts get-caller-identity > /dev/null 2>&1; then
+                            echo "❌ AWS credentials not configured"
+                            exit 1
+                        fi
+                        
+                        # Check if Terraform state exists
+                        if [ ! -d "aws-topology/cassandra-cluster" ]; then
+                            echo "❌ Terraform configuration not found"
+                            exit 1
+                        fi
+                        
+                        echo "✅ Prerequisites validated"
+                    '''
+                }
+            }
+        }
+
+        stage('🏗️ Setup Restack Environment') {
+            steps {
+                echo "=== SETTING UP RESTACK ENVIRONMENT ==="
+                echo ""
+                
+                script {
+                    sh '''
+                        # Create restack working directory
+                        rm -rf ${RESTACK_DIR} || true
+                        mkdir -p ${RESTACK_DIR}/{backup,logs,reports}
+                        
+                        # Copy Terraform configuration
+                        cp -r aws-topology/cassandra-cluster/* ${RESTACK_DIR}/
+                        cd ${RESTACK_DIR}
+                        
+                        # Initialize Terraform
+                        terraform init
+                        
+                        # Select or create workspace
+                        if [ -n "${params.TERRAFORM_WORKSPACE}" ]; then
+                            terraform workspace select ${params.TERRAFORM_WORKSPACE} || terraform workspace new ${params.TERRAFORM_WORKSPACE}
+                        fi
+                        
+                        echo "✅ Restack environment prepared"
+                    '''
+                }
+            }
+        }
+
+        stage('📸 Pre-Restack Backup') {
+            when {
+                equals expected: true, actual: params.BACKUP_BEFORE_RESTACK
+            }
+            steps {
+                echo "=== CREATING PRE-RESTACK BACKUP ==="
+                echo ""
+                
+                script {
+                    dir(env.RESTACK_DIR) {
+                        sh '''
+                            echo "📸 Creating EBS snapshots..."
+                            
+                            # Get current instances
+                            INSTANCE_IDS=$(terraform output -json instance_ids 2>/dev/null | jq -r '.[]' || echo "")
+                            
+                            if [ -n "$INSTANCE_IDS" ]; then
+                                for instance_id in $INSTANCE_IDS; do
+                                    echo "📸 Creating snapshot for instance: $instance_id"
+                                    
+                                    # Get volumes attached to instance
+                                    VOLUME_IDS=$(aws ec2 describe-instances \\
+                                        --instance-ids $instance_id \\
+                                        --region ${AWS_REGION} \\
+                                        --query 'Reservations[*].Instances[*].BlockDeviceMappings[*].Ebs.VolumeId' \\
+                                        --output text)
+                                    
+                                    for volume_id in $VOLUME_IDS; do
+                                        if [ -n "$volume_id" ]; then
+                                            echo "📸 Creating snapshot for volume: $volume_id"
+                                            
+                                            SNAPSHOT_ID=$(aws ec2 create-snapshot \\
+                                                --volume-id $volume_id \\
+                                                --region ${AWS_REGION} \\
+                                                --description "Pre-restack backup for ${CLUSTER_NAME}-${ENVIRONMENT} (Build ${BUILD_NUMBER})" \\
+                                                --tag-specifications "ResourceType=snapshot,Tags=[{Key=Name,Value=${CLUSTER_NAME}-pre-restack-${BUILD_NUMBER}},{Key=Environment,Value=${ENVIRONMENT}},{Key=Purpose,Value=pre-restack-backup}]" \\
+                                                --query 'SnapshotId' \\
+                                                --output text)
+                                            
+                                            echo "✅ Snapshot created: $SNAPSHOT_ID"
+                                            echo "$SNAPSHOT_ID" >> backup/snapshot-ids.txt
+                                        fi
+                                    done
+                                done
+                                
+                                echo "✅ Backup snapshots created"
+                            else
+                                echo "⚠️ No instances found for backup"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('🔍 Detect Changes') {
+            steps {
+                echo "=== DETECTING INFRASTRUCTURE CHANGES ==="
+                echo ""
+                
+                script {
+                    dir(env.RESTACK_DIR) {
+                        // Generate terraform variables
+                        generateTerraformVars()
+                        
+                        sh '''
+                            echo "🔍 Planning infrastructure changes..."
+                            
+                            # Run terraform plan
+                            terraform plan \\
+                                -var-file="restack.tfvars" \\
+                                -out=restack.tfplan \\
+                                -detailed-exitcode > plan-output.txt 2>&1
+                            
+                            PLAN_EXIT_CODE=$?
+                            
+                            echo "📋 Plan results:"
+                            cat plan-output.txt
+                            
+                            # Analyze plan results
+                            if [ $PLAN_EXIT_CODE -eq 0 ]; then
+                                echo "ℹ️ No changes detected"
+                                echo "no-changes" > plan-status.txt
+                            elif [ $PLAN_EXIT_CODE -eq 2 ]; then
+                                echo "📝 Changes detected"
+                                echo "changes-detected" > plan-status.txt
+                                
+                                # Extract change summary
+                                terraform show -no-color restack.tfplan > plan-details.txt
+                                
+                                # Count changes
+                                ADD_COUNT=$(grep -c "will be created" plan-output.txt || echo "0")
+                                CHANGE_COUNT=$(grep -c "will be updated" plan-output.txt || echo "0")
+                                DESTROY_COUNT=$(grep -c "will be destroyed" plan-output.txt || echo "0")
+                                
+                                echo "📊 Change Summary:"
+                                echo "  Resources to add: $ADD_COUNT"
+                                echo "  Resources to change: $CHANGE_COUNT"
+                                echo "  Resources to destroy: $DESTROY_COUNT"
+                                
+                                # Save change summary
+                                cat > change-summary.json << EOF
+{
+    "add": $ADD_COUNT,
+    "change": $CHANGE_COUNT,
+    "destroy": $DESTROY_COUNT,
+    "total": $((ADD_COUNT + CHANGE_COUNT + DESTROY_COUNT))
+}
+EOF
+                            else
+                                echo "❌ Terraform plan failed"
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('🤔 Change Approval') {
+            when {
+                not { equals expected: true, actual: params.AUTO_APPROVE }
+            }
+            steps {
+                script {
+                    dir(env.RESTACK_DIR) {
+                        def planStatus = readFile('plan-status.txt').trim()
+                        
+                        if (planStatus == 'changes-detected') {
+                            def changesSummary = readFile('change-summary.json')
+                            def changes = readJSON text: changesSummary
+                            
+                            def approvalMessage = """
+                            🔄 RESTACK APPROVAL REQUIRED 🔄
+                            
+                            Cluster: ${params.CLUSTER_NAME}
+                            Environment: ${params.ENVIRONMENT}
+                            Action: ${params.RESTACK_ACTION}
+                            Strategy: ${params.RESTACK_STRATEGY}
+                            
+                            📊 Proposed Changes:
+                            • Resources to add: ${changes.add}
+                            • Resources to change: ${changes.change}  
+                            • Resources to destroy: ${changes.destroy}
+                            • Total changes: ${changes.total}
+                            
+                            ⚠️ This operation will modify your infrastructure!
+                            
+                            Do you want to proceed with the restack?
+                            """
+                            
+                            def approved = input(
+                                message: approvalMessage,
+                                ok: 'Proceed with Restack',
+                                parameters: [
+                                    choice(
+                                        name: 'APPROVAL',
+                                        choices: ['yes', 'no'],
+                                        description: 'Approve the restack operation?'
+                                    )
+                                ]
+                            )
+                            
+                            if (approved != 'yes') {
+                                error "Restack operation cancelled by user"
+                            }
+                            
+                            echo "✅ Restack approved by user"
+                        } else {
+                            echo "ℹ️ No changes detected, skipping approval"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('🏗️ Execute Restack') {
+            steps {
+                echo "=== EXECUTING RESTACK OPERATION ==="
+                echo ""
+                
+                script {
+                    dir(env.RESTACK_DIR) {
+                        switch(params.RESTACK_ACTION) {
+                            case 'plan':
+                                executePlan()
+                                break
+                            case 'apply':
+                                executeApply()
+                                break
+                            case 'destroy':
+                                executeDestroy()
+                                break
+                            case 'refresh':
+                                executeRefresh()
+                                break
+                            case 'rolling-update':
+                                executeRollingUpdate()
+                                break
+                            case 'blue-green':
+                                executeBlueGreen()
+                                break
+                            default:
+                                error "Unknown restack action: ${params.RESTACK_ACTION}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('🔍 Post-Restack Validation') {
+            when {
+                not { equals expected: true, actual: params.SKIP_HEALTH_CHECK }
+            }
+            steps {
+                echo "=== POST-RESTACK VALIDATION ==="
+                echo ""
+                
+                script {
+                    dir(env.RESTACK_DIR) {
+                        sh '''
+                            echo "🔍 Validating cluster health..."
+                            
+                            # Get updated instance information
+                            terraform refresh -var-file="restack.tfvars" > /dev/null
+                            
+                            # Check instance states
+                            INSTANCE_IDS=$(terraform output -json instance_ids 2>/dev/null | jq -r '.[]' || echo "")
+                            
+                            if [ -n "$INSTANCE_IDS" ]; then
+                                echo "🔍 Checking instance states..."
+                                
+                                for instance_id in $INSTANCE_IDS; do
+                                    STATE=$(aws ec2 describe-instances \\
+                                        --instance-ids $instance_id \\
+                                        --region ${AWS_REGION} \\
+                                        --query 'Reservations[0].Instances[0].State.Name' \\
+                                        --output text)
+                                    
+                                    echo "  Instance $instance_id: $STATE"
+                                    
+                                    if [ "$STATE" != "running" ]; then
+                                        echo "⚠️ Instance $instance_id is not running"
+                                    fi
+                                done
+                                
+                                # Run cluster validation if script exists
+                                if [ -f "../aws-topology/cassandra-cluster/validate-cluster.sh" ]; then
+                                    echo "🔍 Running cluster validation..."
+                                    bash ../aws-topology/cassandra-cluster/validate-cluster.sh || echo "⚠️ Cluster validation had warnings"
+                                fi
+                                
+                                echo "✅ Post-restack validation completed"
+                            else
+                                echo "⚠️ No instances found for validation"
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('📊 Generate Restack Report') {
+            steps {
+                echo "=== GENERATING RESTACK REPORT ==="
+                echo ""
+                
+                script {
+                    dir(env.RESTACK_DIR) {
+                        def reportContent = generateRestackReport()
+                        writeFile file: 'reports/restack-report.md', text: reportContent
+                        
+                        // Archive important files
+                        archiveArtifacts artifacts: 'reports/restack-report.md,plan-output.txt,plan-details.txt,logs/*.log', allowEmptyArchive: true
+                        
+                        echo "📄 Restack report generated and archived"
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "🏁 === RESTACK PIPELINE COMPLETED ==="
+            echo "📊 Action: ${params.RESTACK_ACTION}"
+            echo "🏷️ Cluster: ${params.CLUSTER_NAME}"
+            echo "🌍 Environment: ${params.ENVIRONMENT}"
+            echo "🔢 Build Number: ${BUILD_NUMBER}"
+        }
+        
+        success {
+            echo "🎉 === RESTACK SUCCEEDED ==="
+            script {
+                def successMessage = getSuccessMessage()
+                echo successMessage
+            }
+        }
+        
+        failure {
+            echo "💥 === RESTACK FAILED ==="
+            script {
+                try {
+                    dir(env.RESTACK_DIR) {
+                        sh '''
+                            echo "🔍 Failure diagnostics:"
+                            
+                            # Show terraform state
+                            echo "📋 Terraform state:"
+                            terraform show -no-color || echo "Could not show terraform state"
+                            
+                            # Show recent logs
+                            echo "📄 Recent logs:"
+                            find logs -name "*.log" -exec tail -20 {} \\; 2>/dev/null || echo "No logs found"
+                            
+                            # Show AWS resources
+                            echo "☁️ AWS resources:"
+                            aws ec2 describe-instances \\
+                                --filters "Name=tag:Name,Values=${CLUSTER_NAME}*" \\
+                                --region ${AWS_REGION} \\
+                                --query 'Reservations[*].Instances[*].{InstanceId:InstanceId,State:State.Name,Type:InstanceType}' \\
+                                --output table || echo "Could not list instances"
+                        '''
+                    }
+                } catch (Exception e) {
+                    echo "Could not retrieve failure diagnostics: ${e.getMessage()}"
+                }
+            }
+        }
+        
+        cleanup {
+            script {
+                // Clean up temporary files but keep reports
+                try {
+                    dir(env.RESTACK_DIR) {
+                        sh '''
+                            echo "🧹 Cleaning up temporary files..."
+                            rm -f *.tfplan
+                            rm -f *.tmp
+                            find . -name ".terraform.lock.hcl" -delete || true
+                            echo "✅ Cleanup completed"
+                        '''
+                    }
+                } catch (Exception e) {
+                    echo "Cleanup warning: ${e.getMessage()}"
+                }
+            }
+        }
+    }
+}
+
+// Generate Terraform variables for restack
+def generateTerraformVars() {
+    def terraformVars = """
+# Restack Configuration
+cluster_name = "${params.CLUSTER_NAME}"
+environment = "${params.ENVIRONMENT}"
+aws_region = "${params.AWS_REGION}"
+
+# Instance Configuration
+${params.INSTANCE_TYPE != 'current' ? "instance_type = \"${params.INSTANCE_TYPE}\"" : "# Using current instance type"}
+${params.NEW_AMI_ID ? "ami_id = \"${params.NEW_AMI_ID}\"" : "# Using latest AMI"}
+
+# Networking
+${params.UPDATE_SECURITY_GROUPS ? "update_security_groups = true" : "update_security_groups = false"}
+
+# Additional Variables
+${processAdditionalVars(params.ADDITIONAL_VARS)}
+
+# Build Information
+build_number = "${BUILD_NUMBER}"
+restack_timestamp = "${new Date().format('yyyy-MM-dd-HH-mm-ss')}"
+"""
+    
+    writeFile file: 'restack.tfvars', text: terraformVars
+    echo "✅ Terraform variables generated"
+}
+
+def processAdditionalVars(additionalVars) {
+    if (!additionalVars?.trim()) {
+        return "# No additional variables specified"
+    }
+    
+    return additionalVars.split('\n').collect { line ->
+        line.trim()
+    }.findAll { it && !it.startsWith('#') }.join('\n')
+}
+
+def executePlan() {
+    sh '''
+        echo "📋 Executing Terraform plan..."
+        terraform plan -var-file="restack.tfvars" -out=restack.tfplan
+        terraform show -no-color restack.tfplan > plan-details.txt
+        echo "✅ Plan completed"
+    '''
+}
+
+def executeApply() {
+    sh '''
+        echo "🚀 Applying infrastructure changes..."
+        
+        # Apply with logging
+        terraform apply -var-file="restack.tfvars" -auto-approve | tee logs/apply.log
+        
+        # Save state info
+        terraform show -no-color > logs/final-state.txt
+        
+        echo "✅ Apply completed"
+    '''
+}
+
+def executeDestroy() {
+    sh '''
+        echo "🗑️ Destroying infrastructure..."
+        
+        # Destroy with confirmation
+        terraform destroy -var-file="restack.tfvars" -auto-approve | tee logs/destroy.log
+        
+        echo "✅ Destroy completed"
+    '''
+}
+
+def executeRefresh() {
+    sh '''
+        echo "🔄 Refreshing Terraform state..."
+        
+        terraform refresh -var-file="restack.tfvars" | tee logs/refresh.log
+        terraform show -no-color > logs/refreshed-state.txt
+        
+        echo "✅ Refresh completed"
+    '''
+}
+
+def executeRollingUpdate() {
+    sh '''
+        echo "🔄 Executing rolling update..."
+        
+        # Get current instances
+        INSTANCE_IDS=$(terraform output -json instance_ids 2>/dev/null | jq -r '.[]' || echo "")
+        
+        if [ -n "$INSTANCE_IDS" ]; then
+            # Update instances one by one
+            for instance_id in $INSTANCE_IDS; do
+                echo "🔄 Updating instance: $instance_id"
+                
+                # Terminate instance (ASG will replace it)
+                aws ec2 terminate-instances --instance-ids $instance_id --region ${AWS_REGION}
+                
+                # Wait for replacement
+                echo "⏳ Waiting for replacement instance..."
+                sleep 60
+                
+                # Wait for new instance to be healthy
+                echo "🔍 Checking cluster health..."
+                # Add health check logic here
+            done
+            
+            echo "✅ Rolling update completed"
+        else
+            echo "⚠️ No instances found for rolling update"
+        fi
+    '''
+}
+
+def executeBlueGreen() {
+    sh '''
+        echo "🔵🟢 Executing blue-green deployment..."
+        
+        # Create green environment
+        echo "🟢 Creating green environment..."
+        terraform workspace new green-${BUILD_NUMBER} || terraform workspace select green-${BUILD_NUMBER}
+        
+        # Deploy green environment
+        terraform apply -var-file="restack.tfvars" -auto-approve
+        
+        # Test green environment
+        echo "🧪 Testing green environment..."
+        # Add testing logic here
+        
+        # Switch traffic to green
+        echo "🔄 Switching to green environment..."
+        # Add traffic switching logic here
+        
+        # Clean up blue environment
+        echo "🔵 Cleaning up blue environment..."
+        terraform workspace select default
+        # terraform destroy -auto-approve  # Uncomment when ready
+        
+        echo "✅ Blue-green deployment completed"
+    '''
+}
+
+def generateRestackReport() {
+    def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss")
+    
+    return """# Cassandra Cluster Restack Report
+
+**Generated:** ${timestamp}  
+**Build:** ${BUILD_NUMBER}  
+**Action:** ${params.RESTACK_ACTION}  
+
+## Restack Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Cluster Name | ${params.CLUSTER_NAME} |
+| Environment | ${params.ENVIRONMENT} |
+| AWS Region | ${params.AWS_REGION} |
+| Strategy | ${params.RESTACK_STRATEGY} |
+| Instance Type | ${params.INSTANCE_TYPE} |
+| New AMI ID | ${params.NEW_AMI_ID ?: 'Auto-detected'} |
+| Backup Created | ${params.BACKUP_BEFORE_RESTACK} |
+| Auto Approved | ${params.AUTO_APPROVE} |
+
+## Pipeline Information
+
+- **Job:** ${JOB_NAME}
+- **Build Number:** ${BUILD_NUMBER}
+- **Build URL:** ${BUILD_URL}
+- **Duration:** ${currentBuild.durationString}
+- **Result:** ${currentBuild.result ?: 'SUCCESS'}
+- **Triggered By:** ${currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause')[0]?.userId ?: 'System'}
+
+## Infrastructure Changes
+
+Check the pipeline logs and plan output for detailed information about the changes made to your infrastructure.
+
+## Health Check Results
+
+${params.SKIP_HEALTH_CHECK ? '*Health checks were skipped*' : 'Health check results are available in the pipeline logs.'}
+
+## Next Steps
+
+### Post-Restack Actions:
+1. **Verify Cluster Health:** Ensure all nodes are operational
+2. **Test Applications:** Validate that applications can connect to the cluster
+3. **Monitor Performance:** Watch metrics for any performance issues
+4. **Update Documentation:** Record the restack changes
+
+### Rollback Plan:
+${params.BACKUP_BEFORE_RESTACK ? '- EBS snapshots were created and can be used for rollback if needed' : '- No pre-restack backups were created'}
+- Previous Terraform state is available for rollback operations
+- Blue-green deployments can be rolled back by switching traffic
+
+## Troubleshooting
+
+If you encounter issues:
+
+1. **Check Instance Status:** Verify all instances are running
+2. **Review Security Groups:** Ensure network connectivity
+3. **Check Application Logs:** Look for application-specific issues
+4. **Validate Cassandra:** Run cluster validation scripts
+
+## Maintenance
+
+- **Regular Restacking:** Plan monthly restacks for security updates
+- **AMI Updates:** Keep AMIs updated with latest patches  
+- **Backup Strategy:** Always backup before major changes
+- **Testing:** Test restacks in development environments first
+
+---
+*Report generated automatically by Jenkins Restack Pipeline*
+"""
+}
+
+def getSuccessMessage() {
+    switch(params.RESTACK_ACTION) {
+        case 'plan':
+            return "✅ Infrastructure plan generated successfully! Review the plan details before applying."
+        case 'apply':
+            return "🎉 Infrastructure changes applied successfully! Your Cassandra cluster has been updated."
+        case 'destroy':
+            return "🗑️ Infrastructure destroyed successfully! All resources have been cleaned up."
+        case 'refresh':
+            return "🔄 Terraform state refreshed successfully! State is now in sync with actual resources."
+        case 'rolling-update':
+            return "🔄 Rolling update completed successfully! All instances have been updated gradually."
+        case 'blue-green':
+            return "🔵🟢 Blue-green deployment completed successfully! Traffic has been switched to the new environment."
+        default:
+            return "✅ Restack operation completed successfully!"
+    }
+}

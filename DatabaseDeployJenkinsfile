@@ -1,0 +1,630 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'DATABASE_TYPE',
+            choices: ['cassandra', 'dynamodb'],
+            description: 'Select the database type to deploy'
+        )
+        choice(
+            name: 'DEPLOYMENT_ACTION',
+            choices: ['deploy', 'plan', 'destroy', 'validate', 'scale', 'backup'],
+            description: 'Select the deployment action to perform'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target environment for deployment'
+        )
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'database-cluster',
+            description: 'Name of the database cluster'
+        )
+        choice(
+            name: 'DEPLOYMENT_MODE',
+            choices: ['production', 'free-tier'],
+            description: 'Deployment mode: production (full features) or free-tier (cost optimized)'
+        )
+        string(
+            name: 'AWS_REGION',
+            defaultValue: 'us-east-1',
+            description: 'AWS region for deployment'
+        )
+        booleanParam(
+            name: 'ENABLE_MONITORING',
+            defaultValue: true,
+            description: 'Enable CloudWatch monitoring and logging'
+        )
+        string(
+            name: 'SSH_PUBLIC_KEY',
+            defaultValue: '',
+            description: 'SSH public key for instance access (Cassandra only - leave empty to use default)'
+        )
+        text(
+            name: 'ADDITIONAL_VARS',
+            defaultValue: '',
+            description: 'Additional Terraform variables (key=value format, one per line)'
+        )
+        
+        // Cassandra-specific parameters
+        choice(
+            name: 'CASSANDRA_NODE_COUNT',
+            choices: ['1', '3', '5', '7', '9'],
+            description: 'Number of Cassandra nodes (Cassandra only)'
+        )
+        choice(
+            name: 'CASSANDRA_INSTANCE_TYPE',
+            choices: ['t2.micro', 't2.small', 't3.medium', 't3.large', 'm5.large', 'm5.xlarge', 'r5.large', 'r5.xlarge'],
+            description: 'EC2 instance type for Cassandra nodes'
+        )
+        booleanParam(
+            name: 'CASSANDRA_ENABLE_LOAD_BALANCER',
+            defaultValue: false,
+            description: 'Enable load balancer for Cassandra cluster'
+        )
+        
+        // DynamoDB-specific parameters
+        choice(
+            name: 'DYNAMODB_BILLING_MODE',
+            choices: ['PAY_PER_REQUEST', 'PROVISIONED'],
+            description: 'DynamoDB billing mode'
+        )
+        string(
+            name: 'DYNAMODB_HASH_KEY',
+            defaultValue: 'id',
+            description: 'DynamoDB hash key (partition key)'
+        )
+        string(
+            name: 'DYNAMODB_RANGE_KEY',
+            defaultValue: '',
+            description: 'DynamoDB range key (sort key) - optional'
+        )
+        string(
+            name: 'DYNAMODB_READ_CAPACITY',
+            defaultValue: '5',
+            description: 'Read capacity units (for PROVISIONED mode)'
+        )
+        string(
+            name: 'DYNAMODB_WRITE_CAPACITY',
+            defaultValue: '5',
+            description: 'Write capacity units (for PROVISIONED mode)'
+        )
+        booleanParam(
+            name: 'DYNAMODB_ENABLE_STREAMS',
+            defaultValue: false,
+            description: 'Enable DynamoDB Streams'
+        )
+    }
+    
+    environment {
+        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+        TF_VAR_aws_region = "${params.AWS_REGION}"
+        TF_VAR_environment = "${params.ENVIRONMENT}"
+        TF_VAR_cluster_name = "${params.CLUSTER_NAME}"
+        
+        // Database type selection
+        DATABASE_TYPE = "${params.DATABASE_TYPE}"
+        WORKSPACE_DIR = "${params.DATABASE_TYPE == 'cassandra' ? 'aws-topology/cassandra-cluster' : 'aws-topology/dynamodb-cluster'}"
+    }
+    
+    // AWS Credentials Configuration
+    options {
+        // Use AWS credentials from Jenkins credential store
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        timestamps()
+    }
+    
+    stages {
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    echo "🔍 Validating deployment parameters..."
+                    echo "Database Type: ${params.DATABASE_TYPE}"
+                    echo "Deployment Mode: ${params.DEPLOYMENT_MODE}"
+                    echo "Environment: ${params.ENVIRONMENT}"
+                    echo "Cluster Name: ${params.CLUSTER_NAME}"
+                    echo "AWS Region: ${params.AWS_REGION}"
+                    
+                    // Validate database-specific parameters
+                    if (params.DATABASE_TYPE == 'cassandra') {
+                        echo "Cassandra Configuration:"
+                        echo "  - Node Count: ${params.CASSANDRA_NODE_COUNT}"
+                        echo "  - Instance Type: ${params.CASSANDRA_INSTANCE_TYPE}"
+                        echo "  - Load Balancer: ${params.CASSANDRA_ENABLE_LOAD_BALANCER}"
+                        
+                        // Free tier validation for Cassandra
+                        if (params.DEPLOYMENT_MODE == 'free-tier') {
+                            if (params.CASSANDRA_NODE_COUNT != '1') {
+                                error("❌ Free tier mode requires exactly 1 Cassandra node")
+                            }
+                            if (params.CASSANDRA_INSTANCE_TYPE != 't2.micro') {
+                                error("❌ Free tier mode requires t2.micro instance type")
+                            }
+                            if (params.CASSANDRA_ENABLE_LOAD_BALANCER) {
+                                error("❌ Free tier mode cannot use load balancer (costs extra)")
+                            }
+                        }
+                    } else if (params.DATABASE_TYPE == 'dynamodb') {
+                        echo "DynamoDB Configuration:"
+                        echo "  - Billing Mode: ${params.DYNAMODB_BILLING_MODE}"
+                        echo "  - Hash Key: ${params.DYNAMODB_HASH_KEY}"
+                        echo "  - Range Key: ${params.DYNAMODB_RANGE_KEY ?: 'None'}"
+                        echo "  - Streams: ${params.DYNAMODB_ENABLE_STREAMS}"
+                        
+                        if (params.DYNAMODB_BILLING_MODE == 'PROVISIONED') {
+                            echo "  - Read Capacity: ${params.DYNAMODB_READ_CAPACITY} RCU"
+                            echo "  - Write Capacity: ${params.DYNAMODB_WRITE_CAPACITY} WCU"
+                            
+                            // Free tier validation for DynamoDB
+                            if (params.DEPLOYMENT_MODE == 'free-tier') {
+                                def readCap = params.DYNAMODB_READ_CAPACITY as Integer
+                                def writeCap = params.DYNAMODB_WRITE_CAPACITY as Integer
+                                if (readCap > 25 || writeCap > 25) {
+                                    error("❌ Free tier mode: Max 25 RCU and 25 WCU (current: ${readCap} RCU, ${writeCap} WCU)")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Setup Workspace') {
+            steps {
+                script {
+                    echo "📁 Setting up workspace for ${params.DATABASE_TYPE}..."
+                    
+                    // Check if the workspace directory exists
+                    if (!fileExists("${WORKSPACE_DIR}")) {
+                        error("❌ Workspace directory not found: ${WORKSPACE_DIR}")
+                    }
+                    
+                    // Change to the appropriate directory
+                    dir("${WORKSPACE_DIR}") {
+                        echo "✅ Working in directory: ${pwd()}"
+                        
+                        // List available files
+                        sh 'ls -la'
+                        
+                        // Check for required Terraform files
+                        if (!fileExists('main.tf')) {
+                            error("❌ main.tf not found in ${WORKSPACE_DIR}")
+                        }
+                        if (!fileExists('variables.tf')) {
+                            error("❌ variables.tf not found in ${WORKSPACE_DIR}")
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Generate Terraform Variables') {
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        echo "📝 Generating terraform.tfvars file..."
+                        
+                        def tfvarsContent = ""
+                        
+                        // Common variables
+                        tfvarsContent += "aws_region = \\"${params.AWS_REGION}\\"\n"
+                        tfvarsContent += "environment = \\"${params.ENVIRONMENT}\\"\n"
+                        tfvarsContent += "cluster_name = \\"${params.CLUSTER_NAME}\\"\n"
+                        
+                        if (params.DATABASE_TYPE == 'cassandra') {
+                            // Cassandra-specific variables
+                            tfvarsContent += generateCassandraVars()
+                        } else if (params.DATABASE_TYPE == 'dynamodb') {
+                            // DynamoDB-specific variables
+                            tfvarsContent += generateDynamoDBVars()
+                        }
+                        
+                        // Add additional variables if provided
+                        if (params.ADDITIONAL_VARS?.trim()) {
+                            tfvarsContent += "\n# Additional user-provided variables\n"
+                            tfvarsContent += params.ADDITIONAL_VARS.trim() + "\n"
+                        }
+                        
+                        // Write the tfvars file
+                        writeFile file: 'terraform.tfvars', text: tfvarsContent
+                        
+                        echo "✅ Generated terraform.tfvars:"
+                        sh 'cat terraform.tfvars'
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Init') {
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        // Use AWS credentials for Terraform operations
+                        withCredentials([usernamePassword(
+                            credentialsId: 'aws-cli',
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        )]) {
+                            echo "🚀 Initializing Terraform..."
+                            sh 'terraform init'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Validate') {
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'aws-cli',
+                            usernameVariable: 'AWS_ACCESS_KEY_ID',
+                            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                        )]) {
+                            echo "✅ Validating Terraform configuration..."
+                            sh 'terraform validate'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Terraform Plan') {
+            when {
+                anyOf {
+                    expression { params.DEPLOYMENT_ACTION == 'plan' }
+                    expression { params.DEPLOYMENT_ACTION == 'deploy' }
+                }
+            }
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        echo "📋 Creating Terraform plan..."
+                        sh 'terraform plan -out=tfplan'
+                        
+                        // Save plan output for review
+                        sh 'terraform show -no-color tfplan > plan-output.txt'
+                        archiveArtifacts artifacts: 'plan-output.txt', fingerprint: true
+                    }
+                }
+            }
+        }
+        
+        stage('Cost Estimation') {
+            when {
+                anyOf {
+                    expression { params.DEPLOYMENT_ACTION == 'plan' }
+                    expression { params.DEPLOYMENT_ACTION == 'deploy' }
+                }
+            }
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        echo "💰 Estimating deployment costs..."
+                        
+                        if (params.DATABASE_TYPE == 'cassandra') {
+                            if (fileExists('free-tier-calculator.sh')) {
+                                echo "Running Cassandra cost calculator..."
+                                sh 'chmod +x free-tier-calculator.sh && ./free-tier-calculator.sh'
+                            }
+                        } else if (params.DATABASE_TYPE == 'dynamodb') {
+                            echo "DynamoDB cost estimation:"
+                            if (params.DEPLOYMENT_MODE == 'free-tier') {
+                                echo "✅ Free tier configuration detected"
+                                if (params.DYNAMODB_BILLING_MODE == 'PROVISIONED') {
+                                    def readCap = params.DYNAMODB_READ_CAPACITY as Integer
+                                    def writeCap = params.DYNAMODB_WRITE_CAPACITY as Integer
+                                    if (readCap <= 25 && writeCap <= 25) {
+                                        echo "💚 Estimated cost: $0.00/month (within free tier)"
+                                    } else {
+                                        echo "⚠️ Configuration exceeds free tier limits"
+                                    }
+                                } else {
+                                    echo "💙 Pay-per-request pricing (costs depend on usage)"
+                                }
+                            } else {
+                                echo "📊 Production configuration - check AWS pricing calculator"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Deploy/Destroy') {
+            when {
+                anyOf {
+                    expression { params.DEPLOYMENT_ACTION == 'deploy' }
+                    expression { params.DEPLOYMENT_ACTION == 'destroy' }
+                }
+            }
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        if (params.DEPLOYMENT_ACTION == 'deploy') {
+                            echo "🚀 Deploying ${params.DATABASE_TYPE} cluster..."
+                            
+                            // Confirmation for production deployments
+                            if (params.ENVIRONMENT == 'prod') {
+                                timeout(time: 5, unit: 'MINUTES') {
+                                    input message: '⚠️ Confirm production deployment?', 
+                                          ok: 'Deploy to Production',
+                                          parameters: [
+                                              booleanParam(defaultValue: false, 
+                                                         description: 'I understand this will deploy to production', 
+                                                         name: 'PROD_CONFIRM')
+                                          ]
+                                }
+                            }
+                            
+                            sh 'terraform apply -auto-approve tfplan'
+                            
+                        } else if (params.DEPLOYMENT_ACTION == 'destroy') {
+                            echo "💥 Destroying ${params.DATABASE_TYPE} cluster..."
+                            
+                            // Confirmation for destruction
+                            timeout(time: 5, unit: 'MINUTES') {
+                                input message: '⚠️ Confirm resource destruction?', 
+                                      ok: 'Destroy Resources',
+                                      parameters: [
+                                          booleanParam(defaultValue: false, 
+                                                     description: 'I understand this will destroy all resources', 
+                                                     name: 'DESTROY_CONFIRM')
+                                      ]
+                            }
+                            
+                            sh 'terraform destroy -auto-approve'
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Scale Operations') {
+            when {
+                expression { params.DEPLOYMENT_ACTION == 'scale' }
+            }
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        echo "📈 Scaling ${params.DATABASE_TYPE} cluster..."
+                        
+                        if (params.DATABASE_TYPE == 'cassandra') {
+                            // Update node count and apply
+                            def currentVars = readFile('terraform.tfvars')
+                            def updatedVars = currentVars.replaceAll(/asg_desired_capacity\s*=\s*\d+/, "asg_desired_capacity = ${params.CASSANDRA_NODE_COUNT}")
+                            writeFile file: 'terraform.tfvars', text: updatedVars
+                            
+                            sh 'terraform plan -out=scale-plan'
+                            sh 'terraform apply -auto-approve scale-plan'
+                            
+                        } else if (params.DATABASE_TYPE == 'dynamodb') {
+                            if (params.DYNAMODB_BILLING_MODE == 'PROVISIONED') {
+                                // Update capacity and apply
+                                def currentVars = readFile('terraform.tfvars')
+                                def updatedVars = currentVars
+                                    .replaceAll(/read_capacity\s*=\s*\d+/, "read_capacity = ${params.DYNAMODB_READ_CAPACITY}")
+                                    .replaceAll(/write_capacity\s*=\s*\d+/, "write_capacity = ${params.DYNAMODB_WRITE_CAPACITY}")
+                                writeFile file: 'terraform.tfvars', text: updatedVars
+                                
+                                sh 'terraform plan -out=scale-plan'
+                                sh 'terraform apply -auto-approve scale-plan'
+                            } else {
+                                echo "ℹ️ DynamoDB on-demand scaling is automatic"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        stage('Backup Operations') {
+            when {
+                expression { params.DEPLOYMENT_ACTION == 'backup' }
+            }
+            steps {
+                script {
+                    dir("${WORKSPACE_DIR}") {
+                        echo "💾 Creating backup for ${params.DATABASE_TYPE}..."
+                        
+                        if (params.DATABASE_TYPE == 'cassandra') {
+                            // Export Terraform state and create AMI snapshots
+                            sh 'terraform state pull > terraform-state-backup.json'
+                            
+                            // Get instance IDs from Terraform output
+                            def instanceIds = sh(
+                                script: 'terraform output -json cassandra_instance_ids | jq -r ".[]"',
+                                returnStdout: true
+                            ).trim().split('\n')
+                            
+                            // Create AMI backups
+                            for (instanceId in instanceIds) {
+                                sh """
+                                    aws ec2 create-image \\
+                                        --instance-id ${instanceId} \\
+                                        --name "${params.CLUSTER_NAME}-backup-\$(date +%Y%m%d-%H%M%S)" \\
+                                        --description "Automated backup of ${params.CLUSTER_NAME}" \\
+                                        --region ${params.AWS_REGION}
+                                """
+                            }
+                            
+                        } else if (params.DATABASE_TYPE == 'dynamodb') {
+                            // Create DynamoDB backup
+                            def tableName = sh(
+                                script: 'terraform output -raw main_table_name',
+                                returnStdout: true
+                            ).trim()
+                            
+                            sh """
+                                aws dynamodb create-backup \\
+                                    --table-name ${tableName} \\
+                                    --backup-name "${tableName}-backup-\$(date +%Y%m%d-%H%M%S)" \\
+                                    --region ${params.AWS_REGION}
+                            """
+                        }
+                        
+                        archiveArtifacts artifacts: '*.json', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                dir("${WORKSPACE_DIR}") {
+                    // Archive important files
+                    archiveArtifacts artifacts: 'terraform.tfvars', allowEmptyArchive: true
+                    archiveArtifacts artifacts: '*.log', allowEmptyArchive: true
+                    
+                    // Clean up plan files
+                    sh 'rm -f tfplan scale-plan'
+                }
+            }
+        }
+        
+        success {
+            script {
+                echo "✅ ${params.DATABASE_TYPE.toUpperCase()} ${params.DEPLOYMENT_ACTION} completed successfully!"
+                
+                dir("${WORKSPACE_DIR}") {
+                    // Display connection information
+                    if (params.DEPLOYMENT_ACTION == 'deploy') {
+                        echo "🔗 Connection Information:"
+                        try {
+                            sh 'terraform output'
+                        } catch (Exception e) {
+                            echo "Could not retrieve outputs: ${e.message}"
+                        }
+                    }
+                }
+            }
+        }
+        
+        failure {
+            script {
+                echo "❌ ${params.DATABASE_TYPE.toUpperCase()} ${params.DEPLOYMENT_ACTION} failed!"
+                
+                dir("${WORKSPACE_DIR}") {
+                    // Capture error logs
+                    sh 'terraform show > terraform-error-state.txt 2>&1 || true'
+                    archiveArtifacts artifacts: 'terraform-error-state.txt', allowEmptyArchive: true
+                }
+            }
+        }
+    }
+}
+
+// Helper function to generate Cassandra variables
+def generateCassandraVars() {
+    def vars = ""
+    
+    if (params.DEPLOYMENT_MODE == 'free-tier') {
+        vars += """
+# Free Tier Configuration for Cassandra
+instance_type = "t2.micro"
+asg_desired_capacity = 1
+asg_min_size = 1
+asg_max_size = 2
+node_count = 1
+
+# Storage (Free Tier Optimized)
+root_volume_size = 8
+data_volume_size = 20
+data_volume_iops = 0
+data_volume_throughput = 0
+
+# Cost Saving Features
+create_load_balancer = false
+enable_monitoring = false
+enable_encryption_at_rest = false
+assign_elastic_ips = false
+
+# Cassandra Tuning for t2.micro
+cassandra_heap_size = "512M"
+"""
+    } else {
+        vars += """
+# Production Configuration for Cassandra
+instance_type = "${params.CASSANDRA_INSTANCE_TYPE}"
+asg_desired_capacity = ${params.CASSANDRA_NODE_COUNT}
+asg_min_size = ${params.CASSANDRA_NODE_COUNT}
+asg_max_size = ${(params.CASSANDRA_NODE_COUNT as Integer) * 2}
+node_count = ${params.CASSANDRA_NODE_COUNT}
+
+# Storage
+root_volume_size = 20
+data_volume_size = 100
+data_volume_iops = 3000
+data_volume_throughput = 125
+
+# Features
+create_load_balancer = ${params.CASSANDRA_ENABLE_LOAD_BALANCER}
+enable_monitoring = ${params.ENABLE_MONITORING}
+enable_encryption_at_rest = true
+assign_elastic_ips = true
+
+# Cassandra Configuration
+cassandra_heap_size = "${params.CASSANDRA_INSTANCE_TYPE.startsWith('t2.') ? '1G' : '4G'}"
+"""
+    }
+    
+    // Add SSH key if provided
+    if (params.SSH_PUBLIC_KEY?.trim()) {
+        vars += "public_key = \\"${params.SSH_PUBLIC_KEY}\\"\n"
+    }
+    
+    return vars
+}
+
+// Helper function to generate DynamoDB variables
+def generateDynamoDBVars() {
+    def vars = ""
+    
+    vars += """
+# DynamoDB Configuration
+billing_mode = "${params.DYNAMODB_BILLING_MODE}"
+hash_key = "${params.DYNAMODB_HASH_KEY}"
+hash_key_type = "S"
+"""
+    
+    if (params.DYNAMODB_RANGE_KEY?.trim()) {
+        vars += "range_key = \\"${params.DYNAMODB_RANGE_KEY}\\"\n"
+        vars += "range_key_type = \\"S\\"\n"
+    }
+    
+    if (params.DYNAMODB_BILLING_MODE == 'PROVISIONED') {
+        vars += "read_capacity = ${params.DYNAMODB_READ_CAPACITY}\n"
+        vars += "write_capacity = ${params.DYNAMODB_WRITE_CAPACITY}\n"
+    }
+    
+    if (params.DEPLOYMENT_MODE == 'free-tier') {
+        vars += """
+# Free Tier Configuration
+free_tier_mode = true
+enable_encryption = false
+enable_point_in_time_recovery = false
+enable_deletion_protection = false
+create_sns_topic = false
+enable_monitoring = false
+"""
+    } else {
+        vars += """
+# Production Configuration
+free_tier_mode = false
+enable_encryption = true
+enable_point_in_time_recovery = true
+enable_deletion_protection = true
+enable_monitoring = ${params.ENABLE_MONITORING}
+"""
+    }
+    
+    vars += "enable_streams = ${params.DYNAMODB_ENABLE_STREAMS}\n"
+    
+    return vars
+}

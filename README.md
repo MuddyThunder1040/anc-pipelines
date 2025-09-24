@@ -1,15 +1,51 @@
 # ANC Pipelines
 
-Advanced Jenkins CI/CD pipeline collection for automated deployment and management of the Express App Server and other applications.
+Advanced Jenkins CI/CD pipeline collection for automated deployment and management of applications and database infrastructure on AWS.
 
 ## 🚀 Overview
 
 This repository contains a comprehensive suite of Jenkins pipelines designed for:
 
+- **Database Deployment**: Choose between Apache Cassandra and Amazon DynamoDB with AWS Free Tier support
 - **Application Deployment**: Automated Express.js application deployment
 - **Docker Management**: Container lifecycle management and orchestration
+- **Infrastructure Management**: Terraform-based AWS resource provisioning
 - **System Monitoring**: Infrastructure health checks and system information gathering
 - **CI/CD Automation**: Complete build, test, and deployment workflows
+
+## 🗄️ NEW: Database Deployment Pipeline
+
+### Unified Database Pipeline (`DatabaseDeployJenkinsfile`)
+
+**Purpose**: Deploy either Apache Cassandra or Amazon DynamoDB with cost optimization
+
+**Features**:
+- 🎯 **Database Choice**: Select Cassandra (self-managed) or DynamoDB (serverless)
+- 💰 **Cost Modes**: Production (full features) or Free Tier (cost optimized)
+- 🔧 **Actions**: Deploy, Plan, Destroy, Scale, Backup operations
+- 📊 **Cost Estimation**: Built-in cost calculator and free tier validation
+- 🛡️ **Security**: Encryption, access control, and monitoring
+- 📈 **Scaling**: Auto-scaling groups (Cassandra) or capacity scaling (DynamoDB)
+
+**Quick Start:**
+```bash
+# Interactive deployment helper
+./database-deploy.sh
+
+# Direct deployment
+./database-deploy.sh --database cassandra --mode free-tier --environment dev
+./database-deploy.sh --database dynamodb --mode production --environment prod
+```
+
+### Database Comparison
+
+| Feature | Cassandra | DynamoDB |
+|---------|-----------|----------|
+| **Type** | Self-managed on EC2 | Fully managed serverless |
+| **Free Tier Cost** | $0.00/month | $0.00/month |
+| **Production Cost** | $260-360/month | $50-500+/month |
+| **Management** | Infrastructure required | Zero management |
+| **Best For** | Time-series, IoT data | Web apps, mobile backends |
 
 ## 📁 Pipeline Collection
 

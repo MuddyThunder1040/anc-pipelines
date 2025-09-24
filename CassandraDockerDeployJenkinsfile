@@ -1,0 +1,273 @@
+pipeline {
+    agent {
+        docker {
+            image 'hashicorp/terraform:1.6'
+            args '-u root:root -v /var/run/docker.sock:/var/run/docker.sock'
+        }
+    }
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['deploy', 'plan', 'destroy', 'validate'],
+            description: 'Deployment action'
+        )
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'cassandra',
+            description: 'Cluster name'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Environment'
+        )
+        string(
+            name: 'NODE_COUNT',
+            defaultValue: '3',
+            description: 'Number of nodes'
+        )
+        string(
+            name: 'INSTANCE_TYPE',
+            defaultValue: 'm5.large',
+            description: 'EC2 instance type'
+        )
+        credentials(
+            name: 'AWS_CREDENTIALS',
+            credentialsId: 'aws-credentials',
+            description: 'AWS credentials'
+        )
+        credentials(
+            name: 'SSH_KEY_CREDENTIALS',
+            credentialsId: 'ssh-key-credentials',
+            description: 'SSH private key'
+        )
+    }
+    
+    environment {
+        TF_IN_AUTOMATION = 'true'
+        TF_VAR_cluster_name = "${params.CLUSTER_NAME}-${params.ENVIRONMENT}"
+        TF_VAR_node_count = "${params.NODE_COUNT}"
+        TF_VAR_instance_type = "${params.INSTANCE_TYPE}"
+        TF_VAR_environment = "${params.ENVIRONMENT}"
+    }
+
+    stages {
+        stage('🐳 Setup Container Environment') {
+            steps {
+                echo "=== CONTAINER SETUP ==="
+                sh '''
+                    apk add --no-cache \
+                        curl \
+                        openssh-client \
+                        jq \
+                        git \
+                        bash
+                    
+                    echo "✅ Container dependencies installed"
+                    terraform version
+                '''
+            }
+        }
+
+        stage('📥 Checkout Code') {
+            steps {
+                echo "=== CODE CHECKOUT ==="
+                script {
+                    // Checkout the infrastructure code
+                    checkout scm
+                    
+                    // Try to get cassandra-cluster files
+                    sh '''
+                        if [ -d "aws-topology/cassandra-cluster" ]; then
+                            echo "✅ Cassandra cluster configuration found"
+                            ls -la aws-topology/cassandra-cluster/
+                        else
+                            echo "❌ Cassandra cluster configuration not found"
+                            mkdir -p aws-topology/cassandra-cluster
+                            echo "Created empty directory for manual file placement"
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('🔐 Setup Credentials') {
+            steps {
+                echo "=== CREDENTIALS SETUP ==="
+                script {
+                    // Setup AWS credentials
+                    withCredentials([aws(credentialsId: params.AWS_CREDENTIALS)]) {
+                        sh '''
+                            aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+                            aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+                            aws configure set region us-east-1
+                            
+                            # Verify credentials
+                            aws sts get-caller-identity
+                        '''
+                    }
+                    
+                    // Setup SSH credentials
+                    withCredentials([sshUserPrivateKey(credentialsId: params.SSH_KEY_CREDENTIALS, keyFileVariable: 'SSH_KEY')]) {
+                        sh '''
+                            mkdir -p ~/.ssh
+                            cp $SSH_KEY ~/.ssh/cassandra-cluster-key
+                            chmod 600 ~/.ssh/cassandra-cluster-key
+                            
+                            # Generate public key
+                            ssh-keygen -y -f ~/.ssh/cassandra-cluster-key > ~/.ssh/cassandra-cluster-key.pub
+                            
+                            echo "✅ SSH credentials configured"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('📝 Generate Configuration') {
+            steps {
+                echo "=== CONFIGURATION GENERATION ==="
+                script {
+                    dir('aws-topology/cassandra-cluster') {
+                        // Generate terraform.tfvars
+                        sh '''
+                            PUBLIC_KEY=$(cat ~/.ssh/cassandra-cluster-key.pub)
+                            
+                            cat > terraform.tfvars << EOF
+# Container-based deployment configuration
+cluster_name = "${TF_VAR_cluster_name}"
+node_count = ${TF_VAR_node_count}
+instance_type = "${TF_VAR_instance_type}"
+environment = "${TF_VAR_environment}"
+aws_region = "us-east-1"
+public_key = "$PUBLIC_KEY"
+vpc_cidr = "10.0.0.0/16"
+ssh_allowed_cidr = ["0.0.0.0/0"]
+assign_elastic_ips = true
+enable_monitoring = true
+data_volume_size = 100
+EOF
+                            
+                            echo "📋 Generated configuration:"
+                            cat terraform.tfvars
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('🏗️ Terraform Operations') {
+            steps {
+                echo "=== TERRAFORM OPERATIONS ==="
+                script {
+                    dir('aws-topology/cassandra-cluster') {
+                        // Initialize Terraform
+                        sh '''
+                            terraform init
+                            terraform validate
+                        '''
+                        
+                        // Execute based on action
+                        switch(params.ACTION) {
+                            case 'plan':
+                                sh 'terraform plan'
+                                break
+                                
+                            case 'deploy':
+                                sh '''
+                                    terraform plan -out=tfplan
+                                    terraform apply -auto-approve tfplan
+                                '''
+                                break
+                                
+                            case 'destroy':
+                                sh 'terraform destroy -auto-approve'
+                                break
+                                
+                            case 'validate':
+                                sh '''
+                                    terraform plan -detailed-exitcode || true
+                                    terraform output || echo "No outputs available"
+                                '''
+                                break
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('📊 Output Results') {
+            when {
+                anyOf {
+                    equals expected: 'deploy', actual: params.ACTION
+                    equals expected: 'validate', actual: params.ACTION
+                }
+            }
+            steps {
+                echo "=== DEPLOYMENT RESULTS ==="
+                script {
+                    dir('aws-topology/cassandra-cluster') {
+                        sh '''
+                            echo "📋 Terraform outputs:"
+                            terraform output -json > outputs.json
+                            
+                            if [ -s outputs.json ]; then
+                                echo "✅ Outputs generated successfully"
+                                jq . outputs.json || cat outputs.json
+                            else
+                                echo "⚠️ No outputs generated"
+                            fi
+                            
+                            echo ""
+                            echo "🔗 SSH Connection Commands:"
+                            terraform output ssh_connection_commands || echo "SSH commands not ready"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            script {
+                // Archive important files
+                archiveArtifacts artifacts: '**/terraform.tfvars, **/outputs.json, **/tfplan', allowEmptyArchive: true
+                
+                // Cleanup sensitive files
+                sh '''
+                    rm -f ~/.ssh/cassandra-cluster-key || true
+                    rm -f ~/.aws/credentials || true
+                '''
+            }
+        }
+        
+        success {
+            echo "🎉 Container-based deployment completed successfully!"
+            script {
+                if (params.ACTION == 'deploy') {
+                    echo "🌐 Cassandra cluster '${params.CLUSTER_NAME}-${params.ENVIRONMENT}' is deployed!"
+                    echo "📖 Next steps:"
+                    echo "   1. Wait 5-10 minutes for cluster initialization"
+                    echo "   2. Use SSH commands from outputs to connect"
+                    echo "   3. Verify cluster: /opt/cassandra/bin/nodetool status"
+                }
+            }
+        }
+        
+        failure {
+            echo "❌ Container-based deployment failed"
+            script {
+                // Capture diagnostics
+                sh '''
+                    echo "🔍 Container diagnostics:"
+                    df -h || true
+                    free -m || true
+                    terraform version || true
+                    aws sts get-caller-identity || true
+                ''' || true
+            }
+        }
+    }
+}

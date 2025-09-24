@@ -1,0 +1,958 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'AMI_ACTION',
+            choices: ['build', 'list', 'cleanup', 'validate'],
+            description: 'AMI management action'
+        )
+        string(
+            name: 'AMI_NAME',
+            defaultValue: 'cassandra-cluster-ami',
+            description: 'Name for the AMI'
+        )
+        choice(
+            name: 'CASSANDRA_VERSION',
+            choices: ['4.1.3', '4.1.2', '4.0.7', '3.11.14'],
+            description: 'Cassandra version to install'
+        )
+        choice(
+            name: 'BASE_AMI_TYPE',
+            choices: ['amazon-linux-2', 'ubuntu-20.04', 'ubuntu-22.04'],
+            description: 'Base AMI to use'
+        )
+        choice(
+            name: 'AWS_REGION',
+            choices: ['us-east-1', 'us-west-2', 'eu-west-1', 'ap-southeast-1'],
+            description: 'AWS region for AMI building'
+        )
+        choice(
+            name: 'INSTANCE_TYPE',
+            choices: ['t3.medium', 't3.large', 'm5.large'],
+            description: 'Instance type for building AMI'
+        )
+        booleanParam(
+            name: 'ENABLE_MONITORING',
+            defaultValue: true,
+            description: 'Install CloudWatch agent and monitoring tools'
+        )
+        booleanParam(
+            name: 'INSTALL_TOOLS',
+            defaultValue: true,
+            description: 'Install additional operational tools'
+        )
+        booleanParam(
+            name: 'OPTIMIZE_AMI',
+            defaultValue: true,
+            description: 'Optimize AMI for production use'
+        )
+        string(
+            name: 'CUSTOM_TAGS',
+            defaultValue: 'Environment=shared,Project=cassandra',
+            description: 'Custom tags for AMI (key=value,key=value)'
+        )
+    }
+    
+    environment {
+        AWS_REGION = "${params.AWS_REGION}"
+        PACKER_VERSION = '1.9.4'
+        ANSIBLE_VERSION = '2.15.0'
+        AMI_BUILD_DIR = 'ami-build'
+    }
+
+    stages {
+        stage('🔍 Pre-Build Setup') {
+            steps {
+                echo "=== AMI BUILD SETUP ==="
+                echo ""
+                echo "📋 Build Configuration:"
+                echo "  Action: ${params.AMI_ACTION}"
+                echo "  AMI Name: ${params.AMI_NAME}"
+                echo "  Cassandra Version: ${params.CASSANDRA_VERSION}"
+                echo "  Base AMI: ${params.BASE_AMI_TYPE}"
+                echo "  Region: ${params.AWS_REGION}"
+                echo "  Instance Type: ${params.INSTANCE_TYPE}"
+                echo ""
+                
+                script {
+                    // Validate prerequisites
+                    sh '''
+                        echo "🔍 Checking prerequisites..."
+                        
+                        # Check AWS CLI
+                        if ! command -v aws &> /dev/null; then
+                            echo "❌ AWS CLI not found"
+                            exit 1
+                        fi
+                        
+                        # Verify AWS credentials
+                        if ! aws sts get-caller-identity > /dev/null 2>&1; then
+                            echo "❌ AWS credentials not configured"
+                            exit 1
+                        fi
+                        
+                        echo "✅ Prerequisites validated"
+                    '''
+                }
+            }
+        }
+
+        stage('🛠️ Install Build Tools') {
+            steps {
+                echo "=== INSTALLING BUILD TOOLS ==="
+                echo ""
+                
+                script {
+                    sh '''
+                        echo "📦 Installing Packer..."
+                        
+                        # Download and install Packer if not already installed
+                        if ! command -v packer &> /dev/null || [ "$(packer version | head -n1 | cut -d' ' -f2)" != "v${PACKER_VERSION}" ]; then
+                            wget -q https://releases.hashicorp.com/packer/${PACKER_VERSION}/packer_${PACKER_VERSION}_linux_amd64.zip
+                            unzip -o packer_${PACKER_VERSION}_linux_amd64.zip
+                            sudo mv packer /usr/local/bin/
+                            rm -f packer_${PACKER_VERSION}_linux_amd64.zip
+                        fi
+                        
+                        echo "📦 Installing Ansible..."
+                        
+                        # Install Ansible if not already installed
+                        if ! command -v ansible &> /dev/null; then
+                            pip3 install ansible==${ANSIBLE_VERSION} || pip install ansible==${ANSIBLE_VERSION}
+                        fi
+                        
+                        echo "✅ Build tools installed"
+                        packer version
+                        ansible --version | head -n1
+                    '''
+                }
+            }
+        }
+
+        stage('📁 Setup Build Environment') {
+            steps {
+                echo "=== SETTING UP BUILD ENVIRONMENT ==="
+                echo ""
+                
+                script {
+                    // Create build directory structure
+                    sh '''
+                        rm -rf ${AMI_BUILD_DIR} || true
+                        mkdir -p ${AMI_BUILD_DIR}/{packer,ansible,scripts}
+                        cd ${AMI_BUILD_DIR}
+                        
+                        echo "✅ Build directory structure created"
+                        tree . || ls -la
+                    '''
+                }
+            }
+        }
+
+        stage('📝 Generate Build Configuration') {
+            steps {
+                echo "=== GENERATING BUILD CONFIGURATION ==="
+                echo ""
+                
+                script {
+                    generatePackerConfig()
+                    generateAnsiblePlaybook()
+                    generateBuildScripts()
+                }
+            }
+        }
+
+        stage('🏗️ Execute AMI Action') {
+            steps {
+                echo "=== EXECUTING ${params.AMI_ACTION.toUpperCase()} ==="
+                echo ""
+                
+                script {
+                    switch(params.AMI_ACTION) {
+                        case 'build':
+                            executeAmiBuild()
+                            break
+                        case 'list':
+                            listAmis()
+                            break
+                        case 'cleanup':
+                            cleanupAmis()
+                            break
+                        case 'validate':
+                            validateAmi()
+                            break
+                        default:
+                            error "Unknown AMI action: ${params.AMI_ACTION}"
+                    }
+                }
+            }
+        }
+
+        stage('🔍 Post-Build Validation') {
+            when {
+                equals expected: 'build', actual: params.AMI_ACTION
+            }
+            steps {
+                echo "=== POST-BUILD VALIDATION ==="
+                echo ""
+                
+                script {
+                    dir(env.AMI_BUILD_DIR) {
+                        sh '''
+                            echo "🔍 Validating built AMI..."
+                            
+                            # Get the AMI ID from Packer manifest
+                            if [ -f packer-manifest.json ]; then
+                                AMI_ID=$(jq -r '.builds[0].custom_data.ami_id' packer-manifest.json 2>/dev/null || 
+                                        jq -r '.builds[0].artifact_id' packer-manifest.json | cut -d: -f2)
+                                
+                                if [ -n "$AMI_ID" ] && [ "$AMI_ID" != "null" ]; then
+                                    echo "✅ AMI built successfully: $AMI_ID"
+                                    
+                                    # Get AMI details
+                                    aws ec2 describe-images --image-ids $AMI_ID --region ${AWS_REGION} \
+                                        --query 'Images[0].{ImageId:ImageId,Name:Name,State:State,CreationDate:CreationDate}' \
+                                        --output table
+                                    
+                                    # Test AMI by launching a test instance (if validation enabled)
+                                    if [ "${params.AMI_ACTION}" = "build" ]; then
+                                        echo "🧪 Launching test instance for validation..."
+                                        
+                                        # Launch test instance
+                                        INSTANCE_ID=$(aws ec2 run-instances \
+                                            --image-id $AMI_ID \
+                                            --instance-type t3.micro \
+                                            --key-name default \
+                                            --security-group-ids default \
+                                            --region ${AWS_REGION} \
+                                            --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-test-${BUILD_NUMBER}},{Key=Purpose,Value=AMI-Validation}]' \
+                                            --query 'Instances[0].InstanceId' \
+                                            --output text 2>/dev/null || echo "")
+                                        
+                                        if [ -n "$INSTANCE_ID" ]; then
+                                            echo "🔍 Test instance launched: $INSTANCE_ID"
+                                            echo "⏳ Waiting for instance to be running..."
+                                            
+                                            # Wait for instance to be running (max 5 minutes)
+                                            aws ec2 wait instance-running --instance-ids $INSTANCE_ID --region ${AWS_REGION} || true
+                                            
+                                            # Get instance details
+                                            aws ec2 describe-instances --instance-ids $INSTANCE_ID --region ${AWS_REGION} \
+                                                --query 'Reservations[0].Instances[0].{InstanceId:InstanceId,State:State.Name,PublicIP:PublicIpAddress}' \
+                                                --output table
+                                            
+                                            # Terminate test instance
+                                            echo "🗑️ Terminating test instance..."
+                                            aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region ${AWS_REGION} > /dev/null
+                                            
+                                            echo "✅ AMI validation completed"
+                                        else
+                                            echo "⚠️ Could not launch test instance for validation"
+                                        fi
+                                    fi
+                                else
+                                    echo "❌ Could not determine AMI ID from build"
+                                    exit 1
+                                fi
+                            else
+                                echo "❌ Packer manifest not found"
+                                exit 1
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('📊 Generate Build Report') {
+            when {
+                equals expected: 'build', actual: params.AMI_ACTION
+            }
+            steps {
+                echo "=== GENERATING BUILD REPORT ==="
+                echo ""
+                
+                script {
+                    dir(env.AMI_BUILD_DIR) {
+                        def reportContent = generateBuildReport()
+                        writeFile file: 'ami-build-report.md', text: reportContent
+                        
+                        echo "📄 Build report generated"
+                        archiveArtifacts artifacts: 'ami-build-report.md,packer-manifest.json,build.log', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "🏁 === AMI BUILD PIPELINE COMPLETED ==="
+            echo "📊 Action: ${params.AMI_ACTION}"
+            echo "🏷️ AMI Name: ${params.AMI_NAME}"
+            echo "🔢 Build Number: ${BUILD_NUMBER}"
+        }
+        
+        success {
+            echo "🎉 === AMI BUILD SUCCEEDED ==="
+            script {
+                if (params.AMI_ACTION == 'build') {
+                    echo "✅ Cassandra AMI built successfully!"
+                    echo "🌐 Next steps:"
+                    echo "   1. Test the AMI with a small instance"
+                    echo "   2. Update your deployment configurations to use the new AMI"
+                    echo "   3. Deploy Cassandra clusters using the optimized AMI"
+                }
+            }
+        }
+        
+        failure {
+            echo "💥 === AMI BUILD FAILED ==="
+            echo "❌ Check the logs above for details"
+            script {
+                try {
+                    dir(env.AMI_BUILD_DIR) {
+                        sh '''
+                            echo "🔍 Build diagnostics:"
+                            ls -la || true
+                            
+                            echo "📄 Packer logs:"
+                            tail -50 build.log 2>/dev/null || echo "No build log found"
+                            
+                            echo "🔧 Packer validation:"
+                            packer validate cassandra-ami.pkr.hcl 2>/dev/null || echo "Packer config invalid"
+                        '''
+                    }
+                } catch (Exception e) {
+                    echo "Could not retrieve diagnostics: ${e.getMessage()}"
+                }
+            }
+        }
+        
+        cleanup {
+            script {
+                // Clean up temporary files
+                sh '''
+                    echo "🧹 Cleaning up temporary files..."
+                    rm -rf ${AMI_BUILD_DIR}/temp || true
+                    find ${AMI_BUILD_DIR} -name "*.tmp" -delete || true
+                    echo "✅ Cleanup completed"
+                '''
+            }
+        }
+    }
+}
+
+// Generate Packer configuration
+def generatePackerConfig() {
+    dir(env.AMI_BUILD_DIR) {
+        def baseAmiFilter = getBaseAmiFilter(params.BASE_AMI_TYPE)
+        def packervars = getPackerVariables()
+        
+        def packerConfig = """
+packer {
+  required_plugins {
+    amazon = {
+      version = ">= 1.2.0"
+      source  = "github.com/hashicorp/amazon"
+    }
+    ansible = {
+      version = "~> 1"
+      source = "github.com/hashicorp/ansible"
+    }
+  }
+}
+
+variable "ami_name" {
+  type    = string
+  default = "${params.AMI_NAME}"
+}
+
+variable "cassandra_version" {
+  type    = string
+  default = "${params.CASSANDRA_VERSION}"
+}
+
+variable "aws_region" {
+  type    = string
+  default = "${params.AWS_REGION}"
+}
+
+variable "instance_type" {
+  type    = string
+  default = "${params.INSTANCE_TYPE}"
+}
+
+locals {
+  timestamp = regex_replace(timestamp(), "[- TZ:]", "")
+  ami_name  = "\${var.ami_name}-\${var.cassandra_version}-\${local.timestamp}"
+}
+
+source "amazon-ebs" "cassandra" {
+  ami_name      = local.ami_name
+  instance_type = var.instance_type
+  region        = var.aws_region
+  
+  source_ami_filter {
+    filters = {
+      ${baseAmiFilter}
+      virtualization-type = "hvm"
+    }
+    most_recent = true
+    owners      = ["amazon"]
+  }
+  
+  ssh_username = "${getSSHUsername(params.BASE_AMI_TYPE)}"
+  
+  tags = {
+    Name                = local.ami_name
+    CassandraVersion    = var.cassandra_version
+    BaseAMI             = "${params.BASE_AMI_TYPE}"
+    BuildDate           = timestamp()
+    BuildNumber         = "${BUILD_NUMBER}"
+    Purpose             = "cassandra-cluster"
+    ${parseCustomTags(params.CUSTOM_TAGS)}
+  }
+  
+  run_tags = {
+    Name = "packer-cassandra-builder-${BUILD_NUMBER}"
+  }
+}
+
+build {
+  name = "cassandra-ami"
+  sources = [
+    "source.amazon-ebs.cassandra"
+  ]
+  
+  # Update system packages
+  provisioner "shell" {
+    inline = [
+      "echo 'Starting AMI build process...'",
+      "sudo ${getUpdateCommand(params.BASE_AMI_TYPE)}",
+      "echo 'System packages updated'"
+    ]
+  }
+  
+  # Run Ansible playbook
+  provisioner "ansible" {
+    playbook_file = "./ansible/cassandra-setup.yml"
+    extra_arguments = [
+      "--extra-vars",
+      "cassandra_version=\${var.cassandra_version}",
+      "--extra-vars",
+      "enable_monitoring=${params.ENABLE_MONITORING}",
+      "--extra-vars",
+      "install_tools=${params.INSTALL_TOOLS}",
+      "--extra-vars",
+      "optimize_ami=${params.OPTIMIZE_AMI}"
+    ]
+  }
+  
+  # Final optimization and cleanup
+  provisioner "shell" {
+    script = "./scripts/finalize-ami.sh"
+  }
+  
+  # Create manifest
+  post-processor "manifest" {
+    output = "packer-manifest.json"
+    strip_path = true
+  }
+}
+"""
+        
+        writeFile file: 'packer/cassandra-ami.pkr.hcl', text: packerConfig
+        echo "✅ Packer configuration generated"
+    }
+}
+
+// Generate Ansible playbook
+def generateAnsiblePlaybook() {
+    dir(env.AMI_BUILD_DIR) {
+        def ansiblePlaybook = '''
+---
+- name: Setup Cassandra AMI
+  hosts: all
+  become: yes
+  vars:
+    cassandra_version: "{{ cassandra_version | default('4.1.3') }}"
+    cassandra_home: "/opt/cassandra"
+    cassandra_user: "cassandra"
+    java_version: "11"
+    enable_monitoring: "{{ enable_monitoring | default(true) }}"
+    install_tools: "{{ install_tools | default(true) }}"
+    optimize_ami: "{{ optimize_ami | default(true) }}"
+    
+  tasks:
+    - name: Create cassandra user
+      user:
+        name: "{{ cassandra_user }}"
+        system: yes
+        shell: /bin/false
+        home: /var/lib/cassandra
+        create_home: yes
+        
+    - name: Install Java
+      package:
+        name: "{{ 'java-11-amazon-corretto-headless' if ansible_distribution == 'Amazon' else 'openjdk-11-jdk-headless' }}"
+        state: present
+        
+    - name: Install required packages
+      package:
+        name:
+          - wget
+          - curl
+          - unzip
+          - htop
+          - iotop
+          - jq
+        state: present
+        
+    - name: Create Cassandra directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ cassandra_user }}"
+        group: "{{ cassandra_user }}"
+        mode: '0755'
+      loop:
+        - "{{ cassandra_home }}"
+        - "/var/lib/cassandra"
+        - "/var/lib/cassandra/data"
+        - "/var/lib/cassandra/commitlog"
+        - "/var/lib/cassandra/saved_caches"
+        - "/var/lib/cassandra/hints"
+        - "/var/log/cassandra"
+        - "/etc/cassandra"
+        
+    - name: Download Cassandra
+      unarchive:
+        src: "https://archive.apache.org/dist/cassandra/{{ cassandra_version }}/apache-cassandra-{{ cassandra_version }}-bin.tar.gz"
+        dest: /opt
+        remote_src: yes
+        owner: "{{ cassandra_user }}"
+        group: "{{ cassandra_user }}"
+        creates: "/opt/apache-cassandra-{{ cassandra_version }}"
+        
+    - name: Create Cassandra symlink
+      file:
+        src: "/opt/apache-cassandra-{{ cassandra_version }}"
+        dest: "{{ cassandra_home }}"
+        state: link
+        force: yes
+        
+    - name: Copy default configuration
+      copy:
+        src: "{{ cassandra_home }}/conf/"
+        dest: "/etc/cassandra/"
+        remote_src: yes
+        owner: "{{ cassandra_user }}"
+        group: "{{ cassandra_user }}"
+        mode: preserve
+        
+    - name: Create systemd service file
+      copy:
+        content: |
+          [Unit]
+          Description=Apache Cassandra
+          After=network.target
+          
+          [Service]
+          Type=forking
+          User={{ cassandra_user }}
+          Group={{ cassandra_user }}
+          ExecStart={{ cassandra_home }}/bin/cassandra -p /var/run/cassandra/cassandra.pid
+          PIDFile=/var/run/cassandra/cassandra.pid
+          StandardOutput=journal
+          StandardError=journal
+          LimitNOFILE=100000
+          LimitMEMLOCK=infinity
+          LimitNPROC=32768
+          LimitAS=infinity
+          TimeoutStartSec=180
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/cassandra.service
+        mode: '0644'
+        
+    - name: Create PID directory
+      file:
+        path: /var/run/cassandra
+        state: directory
+        owner: "{{ cassandra_user }}"
+        group: "{{ cassandra_user }}"
+        mode: '0755'
+        
+    - name: Set environment variables
+      copy:
+        content: |
+          export CASSANDRA_HOME={{ cassandra_home }}
+          export CASSANDRA_CONF=/etc/cassandra
+          export PATH=$PATH:$CASSANDRA_HOME/bin
+        dest: /etc/profile.d/cassandra.sh
+        mode: '0644'
+        
+    - name: Install CloudWatch agent
+      when: enable_monitoring | bool
+      block:
+        - name: Download CloudWatch agent
+          get_url:
+            url: "https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm"
+            dest: /tmp/amazon-cloudwatch-agent.rpm
+            
+        - name: Install CloudWatch agent
+          package:
+            name: /tmp/amazon-cloudwatch-agent.rpm
+            state: present
+            
+    - name: Install additional tools
+      when: install_tools | bool
+      package:
+        name:
+          - vim
+          - nano
+          - tree
+          - nload
+          - nethogs
+          - tcpdump
+        state: present
+        
+    - name: Enable and start systemd services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        daemon_reload: yes
+      loop:
+        - cassandra
+        
+    - name: Set up log rotation
+      copy:
+        content: |
+          /var/log/cassandra/*.log {
+              daily
+              missingok
+              rotate 30
+              compress
+              delaycompress
+              notifempty
+              copytruncate
+              su {{ cassandra_user }} {{ cassandra_user }}
+          }
+        dest: /etc/logrotate.d/cassandra
+        mode: '0644'
+        
+    - name: Optimize system settings
+      when: optimize_ami | bool
+      block:
+        - name: Set kernel parameters
+          sysctl:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            state: present
+            reload: yes
+          loop:
+            - { name: 'vm.max_map_count', value: '1048575' }
+            - { name: 'vm.swappiness', value: '1' }
+            - { name: 'net.core.rmem_max', value: '16777216' }
+            - { name: 'net.core.wmem_max', value: '16777216' }
+            - { name: 'net.core.rmem_default', value: '16777216' }
+            - { name: 'net.core.wmem_default', value: '16777216' }
+            
+        - name: Set ulimits for cassandra user
+          lineinfile:
+            path: /etc/security/limits.conf
+            line: "{{ item }}"
+            create: yes
+          loop:
+            - "{{ cassandra_user }} soft nofile 100000"
+            - "{{ cassandra_user }} hard nofile 100000"
+            - "{{ cassandra_user }} soft nproc 32768"
+            - "{{ cassandra_user }} hard nproc 32768"
+            - "{{ cassandra_user }} soft memlock unlimited"
+            - "{{ cassandra_user }} hard memlock unlimited"
+'''
+        
+        writeFile file: 'ansible/cassandra-setup.yml', text: ansiblePlaybook
+        echo "✅ Ansible playbook generated"
+    }
+}
+
+// Generate build scripts
+def generateBuildScripts() {
+    dir(env.AMI_BUILD_DIR) {
+        def finalizeScript = '''#!/bin/bash
+# AMI Finalization Script
+
+set -e
+
+echo "🔧 Finalizing Cassandra AMI..."
+
+# Clean up temporary files
+echo "🧹 Cleaning up temporary files..."
+sudo rm -rf /tmp/*
+sudo rm -rf /var/tmp/*
+sudo rm -rf /root/.cache
+sudo find /var/log -type f -name "*.log" -exec truncate -s 0 {} \\;
+
+# Clear command history
+echo "🗑️ Clearing command history..."
+history -c
+sudo rm -f /root/.bash_history
+rm -f ~/.bash_history
+
+# Update system packages one final time
+echo "📦 Final package update..."
+if command -v yum &> /dev/null; then
+    sudo yum update -y
+    sudo yum clean all
+elif command -v apt &> /dev/null; then
+    sudo apt update && sudo apt upgrade -y
+    sudo apt autoremove -y
+    sudo apt autoclean
+fi
+
+# Stop services that shouldn't be running in AMI
+echo "🛑 Stopping services..."
+sudo systemctl stop cassandra || true
+
+# Clear SSH host keys (will be regenerated on first boot)
+echo "🔑 Clearing SSH host keys..."
+sudo rm -f /etc/ssh/ssh_host_*
+
+# Clear machine ID
+echo "🆔 Clearing machine ID..."
+sudo truncate -s 0 /etc/machine-id
+
+# Create AMI info file
+echo "📋 Creating AMI info file..."
+sudo tee /opt/ami-info.txt > /dev/null << EOF
+AMI Build Information
+====================
+Build Date: $(date)
+Cassandra Version: $(ls -la /opt/apache-cassandra-* | head -1 | awk '{print $NF}' | sed 's/.*cassandra-//' | sed 's/-bin//')
+Base OS: $(cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')
+Java Version: $(java -version 2>&1 | head -1 | cut -d'"' -f2)
+Build Number: ${BUILD_NUMBER}
+EOF
+
+echo "✅ AMI finalization completed!"
+'''
+        
+        writeFile file: 'scripts/finalize-ami.sh', text: finalizeScript
+        sh 'chmod +x scripts/finalize-ami.sh'
+        
+        echo "✅ Build scripts generated"
+    }
+}
+
+// Execute AMI build
+def executeAmiBuild() {
+    dir(env.AMI_BUILD_DIR) {
+        sh '''
+            echo "🏗️ Starting Packer build..."
+            
+            # Validate Packer configuration
+            packer validate packer/cassandra-ami.pkr.hcl
+            
+            # Build AMI
+            packer build \\
+                -var "ami_name=${AMI_NAME}" \\
+                -var "cassandra_version=${CASSANDRA_VERSION}" \\
+                -var "aws_region=${AWS_REGION}" \\
+                -var "instance_type=${INSTANCE_TYPE}" \\
+                packer/cassandra-ami.pkr.hcl | tee build.log
+            
+            echo "✅ AMI build completed!"
+        '''
+    }
+}
+
+// List AMIs
+def listAmis() {
+    sh '''
+        echo "📋 Listing Cassandra AMIs in region ${AWS_REGION}..."
+        
+        aws ec2 describe-images \\
+            --owners self \\
+            --filters "Name=name,Values=${AMI_NAME}*" \\
+            --region ${AWS_REGION} \\
+            --query 'Images[*].{ImageId:ImageId,Name:Name,State:State,CreationDate:CreationDate,Description:Description}' \\
+            --output table
+    '''
+}
+
+// Cleanup old AMIs
+def cleanupAmis() {
+    sh '''
+        echo "🗑️ Cleaning up old AMIs..."
+        
+        # Get AMIs older than 30 days
+        CUTOFF_DATE=$(date -d "30 days ago" +%Y-%m-%d)
+        
+        OLD_AMIS=$(aws ec2 describe-images \\
+            --owners self \\
+            --filters "Name=name,Values=${AMI_NAME}*" \\
+            --region ${AWS_REGION} \\
+            --query "Images[?CreationDate<'${CUTOFF_DATE}'].ImageId" \\
+            --output text)
+        
+        if [ -n "$OLD_AMIS" ]; then
+            echo "🔍 Found old AMIs to clean up:"
+            echo "$OLD_AMIS"
+            
+            for ami_id in $OLD_AMIS; do
+                echo "🗑️ Deregistering AMI: $ami_id"
+                aws ec2 deregister-image --image-id $ami_id --region ${AWS_REGION}
+                
+                # Also delete associated snapshots
+                SNAPSHOTS=$(aws ec2 describe-images --image-ids $ami_id --region ${AWS_REGION} \\
+                    --query 'Images[0].BlockDeviceMappings[*].Ebs.SnapshotId' --output text 2>/dev/null || echo "")
+                
+                for snapshot_id in $SNAPSHOTS; do
+                    if [ "$snapshot_id" != "None" ] && [ -n "$snapshot_id" ]; then
+                        echo "🗑️ Deleting snapshot: $snapshot_id"
+                        aws ec2 delete-snapshot --snapshot-id $snapshot_id --region ${AWS_REGION}
+                    fi
+                done
+            done
+            
+            echo "✅ Cleanup completed"
+        else
+            echo "ℹ️ No old AMIs found to clean up"
+        fi
+    '''
+}
+
+// Validate AMI
+def validateAmi() {
+    sh '''
+        echo "🔍 Validating AMI configuration..."
+        
+        # Find the latest AMI
+        LATEST_AMI=$(aws ec2 describe-images \\
+            --owners self \\
+            --filters "Name=name,Values=${AMI_NAME}*" \\
+            --region ${AWS_REGION} \\
+            --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId' \\
+            --output text)
+        
+        if [ "$LATEST_AMI" != "None" ] && [ -n "$LATEST_AMI" ]; then
+            echo "✅ Latest AMI found: $LATEST_AMI"
+            
+            # Get AMI details
+            aws ec2 describe-images --image-ids $LATEST_AMI --region ${AWS_REGION} \\
+                --query 'Images[0].{ImageId:ImageId,Name:Name,State:State,Architecture:Architecture,VirtualizationType:VirtualizationType}' \\
+                --output table
+                
+            echo "✅ AMI validation completed"
+        else
+            echo "❌ No AMI found with name pattern: ${AMI_NAME}*"
+            exit 1
+        fi
+    '''
+}
+
+// Helper functions
+def getBaseAmiFilter(baseAmiType) {
+    switch(baseAmiType) {
+        case 'amazon-linux-2':
+            return 'name = "amzn2-ami-hvm-*-x86_64-gp2"'
+        case 'ubuntu-20.04':
+            return 'name = "ubuntu/images/hvm-ssd/ubuntu-focal-20.04-amd64-server-*"'
+        case 'ubuntu-22.04':
+            return 'name = "ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*"'
+        default:
+            return 'name = "amzn2-ami-hvm-*-x86_64-gp2"'
+    }
+}
+
+def getSSHUsername(baseAmiType) {
+    switch(baseAmiType) {
+        case 'amazon-linux-2':
+            return 'ec2-user'
+        case 'ubuntu-20.04':
+        case 'ubuntu-22.04':
+            return 'ubuntu'
+        default:
+            return 'ec2-user'
+    }
+}
+
+def getUpdateCommand(baseAmiType) {
+    switch(baseAmiType) {
+        case 'amazon-linux-2':
+            return 'yum update -y'
+        case 'ubuntu-20.04':
+        case 'ubuntu-22.04':
+            return 'apt update && apt upgrade -y'
+        default:
+            return 'yum update -y'
+    }
+}
+
+def parseCustomTags(customTags) {
+    if (!customTags) return ""
+    
+    def tags = customTags.split(',').collect { tag ->
+        def parts = tag.split('=')
+        if (parts.size() == 2) {
+            return "${parts[0].trim()} = \"${parts[1].trim()}\""
+        }
+        return null
+    }.findAll { it != null }
+    
+    return tags.join('\n    ')
+}
+
+def generateBuildReport() {
+    def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss")
+    
+    return """# Cassandra AMI Build Report
+
+**Generated:** ${timestamp}  
+**Build:** ${BUILD_NUMBER}  
+**Action:** ${params.AMI_ACTION}  
+
+## Build Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| AMI Name | ${params.AMI_NAME} |
+| Cassandra Version | ${params.CASSANDRA_VERSION} |
+| Base AMI | ${params.BASE_AMI_TYPE} |
+| AWS Region | ${params.AWS_REGION} |
+| Instance Type | ${params.INSTANCE_TYPE} |
+| Monitoring | ${params.ENABLE_MONITORING} |
+| Tools | ${params.INSTALL_TOOLS} |
+| Optimization | ${params.OPTIMIZE_AMI} |
+
+## Build Information
+
+- **Pipeline:** ${JOB_NAME}
+- **Build Number:** ${BUILD_NUMBER}
+- **Build URL:** ${BUILD_URL}
+- **Duration:** ${currentBuild.durationString}
+- **Result:** ${currentBuild.result ?: 'SUCCESS'}
+
+## AMI Details
+
+Check the pipeline output for the specific AMI ID and validation results.
+
+## Next Steps
+
+### Using the AMI:
+1. Update your Terraform configurations to use the new AMI ID
+2. Deploy Cassandra clusters with faster startup times
+3. Test the AMI in a development environment first
+
+### Maintenance:
+- **Regular Builds:** Update AMIs monthly for security patches
+- **Version Management:** Keep only the latest 3-5 AMIs per version
+- **Testing:** Always validate new AMIs before production use
+
+---
+*Report generated automatically by Jenkins Pipeline*
+"""
+}

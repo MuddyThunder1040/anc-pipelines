@@ -1,0 +1,198 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'ACTION',
+            choices: ['deploy', 'destroy', 'status', 'scale'],
+            description: 'Select deployment action'
+        )
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'cassandra-dev',
+            description: 'Cassandra cluster name'
+        )
+        choice(
+            name: 'NODE_COUNT',
+            choices: ['3', '5', '7'],
+            description: 'Number of nodes'
+        )
+        choice(
+            name: 'INSTANCE_TYPE',
+            choices: ['t3.medium', 'm5.large', 'r5.large'],
+            description: 'Instance type'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto approve changes'
+        )
+    }
+    
+    environment {
+        TF_IN_AUTOMATION = 'true'
+        CLUSTER_DIR = 'aws-topology/cassandra-cluster'
+    }
+
+    stages {
+        stage('🔍 Setup') {
+            steps {
+                echo "=== CASSANDRA CLUSTER DEPLOYMENT ==="
+                echo "Action: ${params.ACTION}"
+                echo "Cluster: ${params.CLUSTER_NAME}"
+                echo "Nodes: ${params.NODE_COUNT}"
+                echo "Instance: ${params.INSTANCE_TYPE}"
+                
+                script {
+                    // Setup repository
+                    sh 'rm -rf aws-topology || true'
+                    sh 'git clone -b master https://github.com/MuddyThunder1040/aws-topology.git || mkdir -p aws-topology/cassandra-cluster'
+                    
+                    // Generate SSH key if needed
+                    sh '''
+                        if [ ! -f ~/.ssh/cassandra-cluster-key ]; then
+                            mkdir -p ~/.ssh
+                            ssh-keygen -t rsa -b 4096 -f ~/.ssh/cassandra-cluster-key -N ""
+                            chmod 600 ~/.ssh/cassandra-cluster-key
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('📝 Configure') {
+            steps {
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        // Generate terraform.tfvars
+                        def publicKey = sh(
+                            script: "cat ~/.ssh/cassandra-cluster-key.pub",
+                            returnStdout: true
+                        ).trim()
+                        
+                        def tfVars = """
+# Quick deployment configuration
+cluster_name = "${params.CLUSTER_NAME}"
+node_count = ${params.NODE_COUNT}
+instance_type = "${params.INSTANCE_TYPE}"
+aws_region = "us-east-1"
+environment = "dev"
+public_key = "${publicKey}"
+vpc_cidr = "10.0.0.0/16"
+ssh_allowed_cidr = ["0.0.0.0/0"]
+assign_elastic_ips = true
+enable_monitoring = true
+data_volume_size = 100
+root_volume_size = 20
+"""
+                        writeFile file: 'terraform.tfvars', text: tfVars
+                        echo "✅ Configuration generated"
+                    }
+                }
+            }
+        }
+
+        stage('🏗️ Terraform') {
+            steps {
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        sh '''
+                            terraform init
+                            terraform validate
+                        '''
+                        
+                        switch(params.ACTION) {
+                            case 'deploy':
+                                sh '''
+                                    terraform plan -out=tfplan
+                                '''
+                                
+                                if (!params.AUTO_APPROVE) {
+                                    input message: 'Approve deployment?', ok: 'Deploy'
+                                }
+                                
+                                sh '''
+                                    terraform apply tfplan
+                                    echo "✅ Deployment completed!"
+                                '''
+                                break
+                                
+                            case 'destroy':
+                                input message: 'Confirm cluster destruction?', ok: 'Destroy'
+                                sh '''
+                                    terraform destroy -auto-approve
+                                    echo "✅ Cluster destroyed!"
+                                '''
+                                break
+                                
+                            case 'status':
+                                sh '''
+                                    terraform output || echo "No outputs available"
+                                    terraform state list | head -10
+                                '''
+                                break
+                                
+                            case 'scale':
+                                sh '''
+                                    terraform plan -out=tfplan
+                                    terraform apply -auto-approve tfplan
+                                    echo "✅ Scaling completed!"
+                                '''
+                                break
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('✅ Validate') {
+            when {
+                anyOf {
+                    equals expected: 'deploy', actual: params.ACTION
+                    equals expected: 'scale', actual: params.ACTION
+                }
+            }
+            steps {
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        sh '''
+                            echo "⏳ Waiting for cluster initialization..."
+                            sleep 60
+                            
+                            if [ -f validate-cluster.sh ]; then
+                                chmod +x validate-cluster.sh
+                                ./validate-cluster.sh || echo "Validation completed with warnings"
+                            fi
+                            
+                            echo "📋 Connection information:"
+                            terraform output ssh_connection_commands || echo "SSH info not ready yet"
+                        '''
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            echo "🎉 ${params.ACTION.toUpperCase()} completed successfully!"
+            script {
+                if (params.ACTION == 'deploy') {
+                    echo "🌐 Your Cassandra cluster '${params.CLUSTER_NAME}' is ready!"
+                    echo "📖 Next steps:"
+                    echo "   1. Wait 5 minutes for full initialization"
+                    echo "   2. Use SSH commands from output to connect"
+                    echo "   3. Check status: /opt/cassandra/bin/nodetool status"
+                }
+            }
+        }
+        
+        failure {
+            echo "❌ ${params.ACTION.toUpperCase()} failed. Check logs above."
+        }
+        
+        always {
+            archiveArtifacts artifacts: '**/terraform.tfvars, **/tfplan, **/outputs.json', allowEmptyArchive: true
+        }
+    }
+}

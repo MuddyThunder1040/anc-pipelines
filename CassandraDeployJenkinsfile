@@ -1,0 +1,687 @@
+pipeline {
+    agent any
+    
+    parameters {
+        choice(
+            name: 'DEPLOYMENT_ACTION',
+            choices: ['deploy', 'plan', 'destroy', 'validate', 'scale', 'backup'],
+            description: 'Select the deployment action to perform'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['dev', 'staging', 'prod'],
+            description: 'Target environment for deployment'
+        )
+        string(
+            name: 'CLUSTER_NAME',
+            defaultValue: 'cassandra-cluster',
+            description: 'Name of the Cassandra cluster'
+        )
+        choice(
+            name: 'NODE_COUNT',
+            choices: ['3', '5', '7', '9'],
+            description: 'Number of Cassandra nodes to deploy'
+        )
+        choice(
+            name: 'INSTANCE_TYPE',
+            choices: ['t3.medium', 't3.large', 'm5.large', 'm5.xlarge', 'r5.large', 'r5.xlarge'],
+            description: 'EC2 instance type for Cassandra nodes'
+        )
+        string(
+            name: 'AWS_REGION',
+            defaultValue: 'us-east-1',
+            description: 'AWS region for deployment'
+        )
+        booleanParam(
+            name: 'ASSIGN_ELASTIC_IPS',
+            defaultValue: true,
+            description: 'Assign Elastic IPs to instances for stable networking'
+        )
+        booleanParam(
+            name: 'ENABLE_MONITORING',
+            defaultValue: true,
+            description: 'Enable CloudWatch monitoring and logging'
+        )
+        string(
+            name: 'SSH_PUBLIC_KEY',
+            defaultValue: '',
+            description: 'SSH public key for instance access (leave empty to use default)'
+        )
+        text(
+            name: 'ADDITIONAL_VARS',
+            defaultValue: '',
+            description: 'Additional Terraform variables (key=value format, one per line)'
+        )
+        booleanParam(
+            name: 'AUTO_APPROVE',
+            defaultValue: false,
+            description: 'Auto-approve Terraform apply (use with caution)'
+        )
+        booleanParam(
+            name: 'FORCE_RECREATE',
+            defaultValue: false,
+            description: 'Force recreate resources (destroys existing cluster)'
+        )
+    }
+    
+    environment {
+        TF_IN_AUTOMATION = 'true'
+        TF_CLI_ARGS = '-no-color'
+        AWS_DEFAULT_REGION = "${params.AWS_REGION}"
+        CLUSTER_DIR = 'aws-topology/cassandra-cluster'
+        TF_VAR_FILE = "terraform-${params.ENVIRONMENT}.tfvars"
+    }
+
+    stages {
+        stage('🔍 Pre-Deployment Validation') {
+            steps {
+                echo "=== PRE-DEPLOYMENT VALIDATION ==="
+                echo ""
+                echo "📋 Deployment Configuration:"
+                echo "  Action: ${params.DEPLOYMENT_ACTION}"
+                echo "  Environment: ${params.ENVIRONMENT}"
+                echo "  Cluster Name: ${params.CLUSTER_NAME}"
+                echo "  Node Count: ${params.NODE_COUNT}"
+                echo "  Instance Type: ${params.INSTANCE_TYPE}"
+                echo "  AWS Region: ${params.AWS_REGION}"
+                echo "  Elastic IPs: ${params.ASSIGN_ELASTIC_IPS}"
+                echo "  Monitoring: ${params.ENABLE_MONITORING}"
+                echo ""
+                
+                script {
+                    // Validate required parameters
+                    if (!params.CLUSTER_NAME) {
+                        error "Cluster name is required"
+                    }
+                    
+                    // Validate SSH key for new deployments
+                    if (params.DEPLOYMENT_ACTION == 'deploy' && !params.SSH_PUBLIC_KEY && !fileExists("${env.WORKSPACE}/.ssh/cassandra-cluster-key.pub")) {
+                        error "SSH public key is required for new deployments. Provide SSH_PUBLIC_KEY parameter or ensure key exists in .ssh/"
+                    }
+                    
+                    // Validate environment-specific requirements
+                    if (params.ENVIRONMENT == 'prod' && params.INSTANCE_TYPE.startsWith('t3.')) {
+                        echo "⚠️ WARNING: Using burstable instances (t3) in production environment"
+                    }
+                }
+            }
+        }
+
+        stage('🔧 Environment Setup') {
+            steps {
+                echo "=== ENVIRONMENT SETUP ==="
+                echo ""
+                echo "📥 Cloning infrastructure repository..."
+                
+                script {
+                    // Clean workspace first
+                    sh 'rm -rf aws-topology || true'
+                    
+                    // Clone the repository
+                    sh "git clone -b master --single-branch https://github.com/MuddyThunder1040/aws-topology.git || echo 'Repository may not exist yet, using local files'"
+                    
+                    // If clone failed, create directory structure
+                    sh """
+                        if [ ! -d "aws-topology/cassandra-cluster" ]; then
+                            echo "📁 Creating local cassandra-cluster directory..."
+                            mkdir -p aws-topology/cassandra-cluster
+                            
+                            # Copy files from workspace if they exist
+                            if [ -d "${env.WORKSPACE}/cassandra-cluster" ]; then
+                                cp -r ${env.WORKSPACE}/cassandra-cluster/* aws-topology/cassandra-cluster/
+                            fi
+                        fi
+                    """
+                }
+                
+                echo "🔍 Verifying Terraform configuration..."
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        sh """
+                            if [ ! -f main.tf ]; then
+                                echo "❌ main.tf not found in cassandra-cluster directory"
+                                ls -la
+                                exit 1
+                            fi
+                            echo "✅ Terraform configuration found"
+                            
+                            echo "📋 Configuration files:"
+                            ls -la *.tf
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('🔑 SSH Key Management') {
+            when {
+                anyOf {
+                    equals expected: 'deploy', actual: params.DEPLOYMENT_ACTION
+                    equals expected: 'validate', actual: params.DEPLOYMENT_ACTION
+                }
+            }
+            steps {
+                echo "=== SSH KEY MANAGEMENT ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        // Handle SSH key setup
+                        if (params.SSH_PUBLIC_KEY) {
+                            echo "🔑 Using provided SSH public key"
+                            sh """
+                                mkdir -p ~/.ssh
+                                echo "${params.SSH_PUBLIC_KEY}" > ~/.ssh/cassandra-cluster-key.pub
+                                chmod 644 ~/.ssh/cassandra-cluster-key.pub
+                            """
+                        } else if (fileExists("~/.ssh/cassandra-cluster-key.pub")) {
+                            echo "🔑 Using existing SSH public key"
+                        } else {
+                            echo "🔑 Generating new SSH key pair..."
+                            sh """
+                                mkdir -p ~/.ssh
+                                ssh-keygen -t rsa -b 4096 -f ~/.ssh/cassandra-cluster-key -N ""
+                                chmod 600 ~/.ssh/cassandra-cluster-key
+                                chmod 644 ~/.ssh/cassandra-cluster-key.pub
+                                
+                                echo "📋 Generated SSH public key:"
+                                cat ~/.ssh/cassandra-cluster-key.pub
+                            """
+                        }
+                        
+                        // Read the public key for Terraform
+                        env.PUBLIC_KEY_CONTENT = sh(
+                            script: "cat ~/.ssh/cassandra-cluster-key.pub",
+                            returnStdout: true
+                        ).trim()
+                    }
+                }
+            }
+        }
+
+        stage('📝 Generate Terraform Variables') {
+            steps {
+                echo "=== GENERATING TERRAFORM VARIABLES ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        // Create environment-specific variables file
+                        def tfVarsContent = """
+# Auto-generated Terraform variables for ${params.ENVIRONMENT} environment
+# Generated by Jenkins pipeline on ${new Date()}
+
+# Basic Configuration
+aws_region     = "${params.AWS_REGION}"
+environment    = "${params.ENVIRONMENT}"
+cluster_name   = "${params.CLUSTER_NAME}-${params.ENVIRONMENT}"
+node_count     = ${params.NODE_COUNT}
+
+# Instance Configuration
+instance_type = "${params.INSTANCE_TYPE}"
+
+# Network Configuration
+vpc_cidr = "10.${params.ENVIRONMENT == 'prod' ? '10' : params.ENVIRONMENT == 'staging' ? '20' : '30'}.0.0/16"
+
+# SSH Access - Restrict in production
+ssh_allowed_cidr = ${params.ENVIRONMENT == 'prod' ? '["10.0.0.0/8"]' : '["0.0.0.0/0"]'}
+
+# SSH Key
+public_key = "${env.PUBLIC_KEY_CONTENT}"
+
+# Storage Configuration
+root_volume_size      = 20
+data_volume_size      = ${params.ENVIRONMENT == 'prod' ? '500' : params.ENVIRONMENT == 'staging' ? '200' : '100'}
+data_volume_iops      = ${params.ENVIRONMENT == 'prod' ? '5000' : '3000'}
+data_volume_throughput = ${params.ENVIRONMENT == 'prod' ? '250' : '125'}
+
+# Features
+assign_elastic_ips    = ${params.ASSIGN_ELASTIC_IPS}
+create_load_balancer  = false
+
+# Cassandra Configuration
+cassandra_version    = "4.1.3"
+cassandra_heap_size  = "${params.INSTANCE_TYPE.contains('xlarge') ? '8G' : '4G'}"
+cassandra_data_center = "dc1"
+
+# Monitoring
+enable_monitoring     = ${params.ENABLE_MONITORING}
+log_retention_days    = ${params.ENVIRONMENT == 'prod' ? '30' : '14'}
+backup_retention_days = ${params.ENVIRONMENT == 'prod' ? '30' : '7'}
+
+# Security
+enable_encryption_at_rest    = true
+enable_encryption_in_transit = ${params.ENVIRONMENT == 'prod' ? 'true' : 'false'}
+"""
+
+                        // Add any additional variables
+                        if (params.ADDITIONAL_VARS) {
+                            tfVarsContent += "\n# Additional Variables\n"
+                            params.ADDITIONAL_VARS.split('\n').each { line ->
+                                if (line.trim() && line.contains('=')) {
+                                    tfVarsContent += "${line.trim()}\n"
+                                }
+                            }
+                        }
+                        
+                        // Write the variables file
+                        writeFile file: env.TF_VAR_FILE, text: tfVarsContent
+                        
+                        echo "📄 Generated variables file: ${env.TF_VAR_FILE}"
+                        echo "📋 Variables content:"
+                        sh "cat ${env.TF_VAR_FILE}"
+                    }
+                }
+            }
+        }
+
+        stage('🏗️ Terraform Initialization') {
+            steps {
+                echo "=== TERRAFORM INITIALIZATION ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        sh """
+                            echo "🔧 Initializing Terraform..."
+                            terraform --version
+                            terraform init -upgrade
+                            
+                            echo "✅ Validating configuration..."
+                            terraform validate
+                            
+                            echo "🎨 Formatting code..."
+                            terraform fmt -check -diff || {
+                                echo "⚠️ Formatting issues detected. Auto-formatting..."
+                                terraform fmt -recursive
+                            }
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('📋 Terraform Plan') {
+            steps {
+                echo "=== TERRAFORM PLAN ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        if (params.FORCE_RECREATE) {
+                            echo "🔄 Force recreate enabled - this will destroy existing resources"
+                        }
+                        
+                        def planArgs = params.FORCE_RECREATE ? "-replace=\"aws_instance.cassandra_nodes\"" : ""
+                        
+                        sh """
+                            echo "📊 Creating Terraform execution plan..."
+                            terraform plan ${planArgs} -var-file=${env.TF_VAR_FILE} -out=tfplan
+                            
+                            echo "📋 Plan summary:"
+                            terraform show -no-color tfplan | head -50
+                            
+                            echo "💰 Cost estimation (if available):"
+                            terraform show -json tfplan | jq '.resource_changes | length' || echo "JSON parsing not available"
+                        """
+                        
+                        // Archive the plan
+                        archiveArtifacts artifacts: 'tfplan', allowEmptyArchive: false
+                    }
+                }
+            }
+        }
+
+        stage('🚀 Execute Deployment Action') {
+            steps {
+                echo "=== EXECUTING ${params.DEPLOYMENT_ACTION.toUpperCase()} ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        switch(params.DEPLOYMENT_ACTION) {
+                            case 'deploy':
+                                executeDeployment()
+                                break
+                            case 'plan':
+                                echo "✅ Plan completed - check the plan output above"
+                                break
+                            case 'destroy':
+                                executeDestroy()
+                                break
+                            case 'validate':
+                                executeValidation()
+                                break
+                            case 'scale':
+                                executeScaling()
+                                break
+                            case 'backup':
+                                executeBackup()
+                                break
+                            default:
+                                error "Unknown deployment action: ${params.DEPLOYMENT_ACTION}"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('🔍 Post-Deployment Validation') {
+            when {
+                anyOf {
+                    equals expected: 'deploy', actual: params.DEPLOYMENT_ACTION
+                    equals expected: 'scale', actual: params.DEPLOYMENT_ACTION
+                    equals expected: 'validate', actual: params.DEPLOYMENT_ACTION
+                }
+            }
+            steps {
+                echo "=== POST-DEPLOYMENT VALIDATION ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        sh """
+                            echo "🔍 Running cluster validation..."
+                            
+                            # Wait for instances to be fully ready
+                            echo "⏳ Waiting for instances to initialize..."
+                            sleep 60
+                            
+                            # Run validation script if available
+                            if [ -f validate-cluster.sh ]; then
+                                chmod +x validate-cluster.sh
+                                ./validate-cluster.sh || echo "⚠️ Validation completed with warnings"
+                            else
+                                echo "📊 Basic Terraform validation:"
+                                terraform show -no-color | head -20
+                            fi
+                        """
+                        
+                        // Get and display outputs
+                        sh """
+                            echo "📋 Deployment outputs:"
+                            terraform output -json > outputs.json
+                            
+                            echo "🌐 Connection Information:"
+                            terraform output ssh_connection_commands || echo "SSH commands not available yet"
+                            
+                            echo "💰 Cost Information:"
+                            terraform output estimated_monthly_cost || echo "Cost information not available"
+                        """
+                        
+                        // Archive outputs
+                        archiveArtifacts artifacts: 'outputs.json', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+
+        stage('📊 Generate Deployment Report') {
+            steps {
+                echo "=== GENERATING DEPLOYMENT REPORT ==="
+                echo ""
+                
+                script {
+                    dir(env.CLUSTER_DIR) {
+                        def reportContent = generateDeploymentReport()
+                        writeFile file: 'deployment-report.md', text: reportContent
+                        
+                        echo "📄 Deployment report generated"
+                        echo "📋 Report preview:"
+                        sh "head -30 deployment-report.md"
+                        
+                        // Archive the report
+                        archiveArtifacts artifacts: 'deployment-report.md', allowEmptyArchive: true
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        always {
+            echo "🏁 === CASSANDRA DEPLOYMENT PIPELINE COMPLETED ==="
+            echo "📊 Action: ${params.DEPLOYMENT_ACTION}"
+            echo "🏷️ Environment: ${params.ENVIRONMENT}"
+            echo "🔢 Build Number: ${BUILD_NUMBER}"
+            echo "🕐 Duration: ${currentBuild.durationString}"
+        }
+        
+        success {
+            echo "🎉 === DEPLOYMENT SUCCEEDED ==="
+            script {
+                if (params.DEPLOYMENT_ACTION == 'deploy') {
+                    echo "✅ Cassandra cluster deployed successfully!"
+                    echo "🌐 Next steps:"
+                    echo "   1. Wait 5-10 minutes for full cluster initialization"
+                    echo "   2. Use the SSH commands from outputs to connect"
+                    echo "   3. Check cluster status with: nodetool status"
+                    echo "   4. Access CQL shell for database operations"
+                }
+            }
+        }
+        
+        failure {
+            echo "💥 === DEPLOYMENT FAILED ==="
+            echo "❌ Check the logs above for details"
+            script {
+                try {
+                    dir(env.CLUSTER_DIR) {
+                        sh '''
+                            echo "🔍 Terraform diagnostics:"
+                            terraform state list || echo "No state file found"
+                            
+                            echo "📄 Recent terraform logs:"
+                            ls -la terraform.* || echo "No terraform files found"
+                            
+                            echo "☁️ AWS CLI diagnostics:"
+                            aws sts get-caller-identity || echo "AWS CLI not configured"
+                        '''
+                    }
+                } catch (Exception e) {
+                    echo "Could not retrieve diagnostics: ${e.getMessage()}"
+                }
+            }
+        }
+        
+        cleanup {
+            script {
+                // Clean up sensitive files
+                sh '''
+                    echo "🧹 Cleaning up sensitive files..."
+                    rm -f ~/.ssh/cassandra-cluster-key || true
+                    find . -name "*.tfplan" -size +50M -delete 2>/dev/null || true
+                    echo "✅ Cleanup completed"
+                '''
+            }
+        }
+    }
+}
+
+// Helper function for deployment execution
+def executeDeployment() {
+    def approvalRequired = !params.AUTO_APPROVE
+    
+    if (approvalRequired && params.ENVIRONMENT == 'prod') {
+        echo "🔒 Production deployment requires approval"
+        timeout(time: 30, unit: 'MINUTES') {
+            input message: 'Approve production deployment?', 
+                  ok: 'Deploy',
+                  parameters: [
+                      booleanParam(defaultValue: false, description: 'I understand this will deploy to production', name: 'CONFIRM_PROD')
+                  ]
+        }
+    }
+    
+    sh """
+        echo "🚀 Applying Terraform configuration..."
+        
+        if [ "${params.AUTO_APPROVE}" = "true" ]; then
+            terraform apply -auto-approve tfplan
+        else
+            terraform apply tfplan
+        fi
+        
+        echo "✅ Deployment completed!"
+        
+        echo "📊 Resource summary:"
+        terraform state list | head -20
+    """
+}
+
+// Helper function for destroy execution
+def executeDestroy() {
+    echo "⚠️ DESTROY operation - This will remove all infrastructure!"
+    
+    timeout(time: 15, unit: 'MINUTES') {
+        input message: 'Confirm destruction of Cassandra cluster?', 
+              ok: 'Destroy All Resources',
+              parameters: [
+                  string(defaultValue: '', description: 'Type DESTROY to confirm', name: 'DESTROY_CONFIRMATION')
+              ]
+    }
+    
+    if (env.DESTROY_CONFIRMATION != 'DESTROY') {
+        error "Destruction not confirmed properly"
+    }
+    
+    sh """
+        echo "💥 Creating destroy plan..."
+        terraform plan -destroy -var-file=${env.TF_VAR_FILE} -out=destroy-plan
+        
+        echo "🗑️ Executing destroy..."
+        terraform apply destroy-plan
+        
+        echo "✅ Destroy completed!"
+    """
+}
+
+// Helper function for validation execution
+def executeValidation() {
+    sh """
+        echo "🔍 Running comprehensive validation..."
+        
+        # Check if resources exist
+        if terraform state list | grep -q "aws_instance.cassandra_nodes"; then
+            echo "✅ Cassandra instances found in state"
+            
+            # Run validation script
+            if [ -f validate-cluster.sh ]; then
+                chmod +x validate-cluster.sh
+                ./validate-cluster.sh
+            else
+                echo "⚠️ Validation script not found, running basic checks"
+                terraform output
+            fi
+        else
+            echo "❌ No Cassandra instances found. Deploy first."
+            exit 1
+        fi
+    """
+}
+
+// Helper function for scaling execution
+def executeScaling() {
+    sh """
+        echo "📈 Scaling cluster to ${params.NODE_COUNT} nodes..."
+        
+        # Check current node count
+        current_count=\$(terraform output -raw node_count 2>/dev/null || echo "0")
+        echo "Current nodes: \$current_count"
+        echo "Target nodes: ${params.NODE_COUNT}"
+        
+        if [ "\$current_count" -eq "${params.NODE_COUNT}" ]; then
+            echo "✅ Cluster already has ${params.NODE_COUNT} nodes"
+        else
+            echo "🔄 Scaling cluster..."
+            terraform apply -auto-approve -var-file=${env.TF_VAR_FILE}
+            
+            echo "⏳ Waiting for new nodes to join cluster..."
+            sleep 120
+            
+            # Validate cluster health after scaling
+            if [ -f validate-cluster.sh ]; then
+                ./validate-cluster.sh
+            fi
+        fi
+    """
+}
+
+// Helper function for backup execution
+def executeBackup() {
+    sh """
+        echo "💾 Creating cluster backups..."
+        
+        # Get node IPs
+        node_ips=\$(terraform output -json cassandra_public_ips | jq -r '.[]')
+        
+        for ip in \$node_ips; do
+            echo "📸 Creating snapshot on node \$ip..."
+            ssh -i ~/.ssh/cassandra-cluster-key -o ConnectTimeout=10 -o StrictHostKeyChecking=no ec2-user@\$ip \\
+                '/opt/cassandra/bin/nodetool snapshot' || echo "Failed to backup \$ip"
+        done
+        
+        echo "✅ Backup process completed"
+    """
+}
+
+// Helper function to generate deployment report
+def generateDeploymentReport() {
+    def timestamp = new Date().format("yyyy-MM-dd HH:mm:ss")
+    
+    return """# Cassandra Cluster Deployment Report
+
+**Generated:** ${timestamp}  
+**Build:** ${BUILD_NUMBER}  
+**Environment:** ${params.ENVIRONMENT}  
+**Action:** ${params.DEPLOYMENT_ACTION}  
+
+## Deployment Configuration
+
+| Parameter | Value |
+|-----------|-------|
+| Cluster Name | ${params.CLUSTER_NAME}-${params.ENVIRONMENT} |
+| Node Count | ${params.NODE_COUNT} |
+| Instance Type | ${params.INSTANCE_TYPE} |
+| AWS Region | ${params.AWS_REGION} |
+| Elastic IPs | ${params.ASSIGN_ELASTIC_IPS} |
+| Monitoring | ${params.ENABLE_MONITORING} |
+
+## Build Information
+
+- **Pipeline:** ${JOB_NAME}
+- **Build Number:** ${BUILD_NUMBER}
+- **Build URL:** ${BUILD_URL}
+- **Duration:** ${currentBuild.durationString}
+- **Result:** ${currentBuild.result ?: 'SUCCESS'}
+
+## Next Steps
+
+### For New Deployments:
+1. Wait 5-10 minutes for cluster initialization
+2. Use SSH commands from pipeline output to connect
+3. Verify cluster status: `nodetool status`
+4. Create your first keyspace and tables
+
+### For Operations:
+- **Monitor:** Check CloudWatch logs and metrics
+- **Scale:** Re-run pipeline with different node count
+- **Backup:** Use pipeline backup action
+- **Destroy:** Use pipeline destroy action (caution!)
+
+## Troubleshooting
+
+If you encounter issues:
+1. Check the pipeline logs above
+2. Verify AWS credentials and permissions
+3. Ensure SSH key is properly configured
+4. Review CloudWatch logs for detailed error information
+
+## Cost Information
+
+See pipeline output for estimated monthly costs based on your configuration.
+
+---
+*Report generated automatically by Jenkins Pipeline*
+"""
+}
